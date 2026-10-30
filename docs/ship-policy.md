@@ -1025,7 +1025,11 @@ contributes no product change of its own. A receipt carried twice keeps the revi
 `carry: { from, reason, product_patch_id, changed_paths, merge_commits,
 range_diff, covers, reruns, ancestry, trees }` (`ancestry` is `linear`
 along the receipt's own history, `rewritten` once any hop was a rebase;
-`trees` lists the earlier covered trees) with the `git range-diff` evidence, prints
+`trees` lists the earlier covered trees; `covers` names what the recorded
+`review_depth` ran, from `carryCovers`: the adversarial review only at full, at
+standard for the code or gate class, and at light with runtime lines, so a light
+docs-only review's carry does not claim it, and a receipt without a depth claims
+the review with no depth named) with the `git range-diff` evidence, prints
 `CARRY: carried from <old> to <new> (<reason>)` and the `GSTACK_RESULT:
 skill=ship status=complete` line, and its summary line ends with
 `carried_from=<old12>`. `CARRY: current` means the receipt already names HEAD;
