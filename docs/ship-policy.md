@@ -1026,10 +1026,13 @@ contributes no product change of its own. A receipt carried twice keeps the revi
 range_diff, covers, reruns, ancestry, trees }` (`ancestry` is `linear`
 along the receipt's own history, `rewritten` once any hop was a rebase;
 `trees` lists the earlier covered trees; `covers` names what the recorded
-`review_depth` ran, from `carryCovers`: the adversarial review only at full, at
-standard for the code or gate class, and at light with runtime lines, so a light
-docs-only review's carry does not claim it, and a receipt without a depth claims
-the review with no depth named) with the `git range-diff` evidence, prints
+`review_depth` requires, from `carryCovers`: that depth is the one the head
+needed at write, which the review is expected to have met, not a record of what
+ran. The adversarial review is claimed only at full, at standard for the code or
+gate class, and at light with runtime lines, so a light docs-only review's carry
+does not claim it. A later carry keeps the first carry's `covers`, because a
+carry rebinds `review_depth` to its new head, and a receipt without a depth
+claims the review with no depth named) with the `git range-diff` evidence, prints
 `CARRY: carried from <old> to <new> (<reason>)` and the `GSTACK_RESULT:
 skill=ship status=complete` line, and its summary line ends with
 `carried_from=<old12>`. `CARRY: current` means the receipt already names HEAD;
