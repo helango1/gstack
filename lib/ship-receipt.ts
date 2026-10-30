@@ -168,22 +168,26 @@ export interface CarryPlanInput {
   rangeDiff: string;
   /** The base the receipt was reviewed against when it differs from the carry's (a stack parent that landed, #3570): productPatchId.from is then the recorded diff against it. */
   retargetedFrom?: string;
-  /** The receipt's recorded review depth; `covers` claims only what it ran. */
+  /** The receipt's recorded review depth; `covers` claims only what that depth requires. */
   depth?: RecordedDepth;
 }
 export interface CarryRecord { from: string; reason: string; product_patch_id: string; changed_paths: string[]; merge_commits: number; range_diff: string; covers: string[]; reruns: string[]; trees?: string[]; ancestry?: 'linear' | 'rewritten' }
 export type CarryPlan = { ok: true; carry: CarryRecord } | { ok: false; code: 'RECEIPT_CARRY_PRODUCT_CHANGED' | 'RECEIPT_CARRY_REFUSED' | 'RECEIPT_CARRY_TREE_MISMATCH'; message: string };
-/** The review depth the receipt recorded at write: a lower bound, since a blocker or a CRITICAL raises light to standard. */
+/**
+ * The receipt's `review_depth`: the depth the head needed at write, which the
+ * review is expected to have met. It is not a record of what ran: a fail-closed
+ * `full` (dirty checkout, scan unavailable) names more than a light review ran.
+ */
 type RecordedDepth = ShipReceipt['review_depth'];
 
 /**
- * What a carried receipt's review covered, derived from the depth it recorded
- * (docs/review-policy.md#review-depth): light with no runtime lines ran the
- * core checklist only, so its carry claims no adversarial review; standard ran
- * the adversarial pass for the code class only. Gate integrity (core checklist)
- * and the documentation audit run at every depth. A receipt without a depth
- * (written before it was recorded) claims the review without the passes a
- * depth would name.
+ * What a carried receipt's review covered, derived from its recorded depth
+ * (docs/review-policy.md#review-depth): light with no runtime lines needs the
+ * core checklist only, so its carry claims no adversarial review; standard
+ * needs the adversarial pass for the code class only. Gate integrity (core
+ * checklist) and the documentation audit run at every depth. A receipt without
+ * a depth (written before it was recorded) claims the review without the
+ * passes a depth would name.
  */
 export function carryCovers(depth: RecordedDepth): string[] {
   const always = ['gate integrity', 'documentation audit'];
@@ -195,6 +199,9 @@ export function carryCovers(depth: RecordedDepth): string[] {
   const adversarial = depth.depth === 'full' || (depth.depth === 'standard' ? depth.class === 'code' || depth.class === 'gate' : depth.runtime_lines > 0);
   return [review, ...(adversarial ? ['adversarial review'] : []), ...always];
 }
+/** The fixed `covers` every carry recorded before it followed the depth; a later carry reads it, or a missing list, as no depth recorded. */
+const UNDERIVED_COVERS = ['pre-landing review', 'adversarial review', 'gate integrity', 'documentation audit'];
+const underived = (covers: string[]) => covers.length === UNDERIVED_COVERS.length && covers.every((c, i) => c === UNDERIVED_COVERS[i]);
 const CARRY_RERUNS = ['CI at head (gstack-ship-queue ready requires it); test and helper code changed since the reviewed head runs there unreviewed'];
 
 /**
@@ -279,7 +286,7 @@ export interface TreeCarryInput {
   headTree: string; coveredTrees: readonly string[];
   /** The product patch-id against the base the receipt recorded, and the one HEAD has against the current base. */
   productPatchId: { recorded: string; head: string };
-  /** The receipt's recorded review depth; `covers` claims only what it ran. */
+  /** The receipt's recorded review depth; `covers` claims only what that depth requires. */
   depth?: RecordedDepth;
 }
 
@@ -310,11 +317,13 @@ export function planTreeCarry(input: TreeCarryInput): CarryPlan {
  * The carried receipt: the same evidence, bound to the new head, with the carry
  * recorded. A receipt carried before keeps the reviewed head as `from` and adds
  * this hop's merges and paths, so the record always names the head a review saw.
+ * It also keeps the first carry's `covers`: a carry rebinds `review_depth` to
+ * the new head, so a later hop's depth no longer describes the review.
  */
 export function carryReceipt(receipt: ShipReceipt, head: string, carry: CarryRecord, at: { tree: string; fromTree?: string; productPatchId: string }): ShipReceipt {
   const prior = receipt.carry;
   const merged: CarryRecord = !prior ? carry : {
-    ...carry, from: prior.from, reason: prior.reason === carry.reason ? carry.reason : `${prior.reason} + ${carry.reason}`,
+    ...carry, from: prior.from, covers: Array.isArray(prior.covers) && !underived(prior.covers) ? prior.covers : carryCovers(undefined), reason: prior.reason === carry.reason ? carry.reason : `${prior.reason} + ${carry.reason}`,
     merge_commits: prior.merge_commits + carry.merge_commits,
     changed_paths: [...prior.changed_paths, ...carry.changed_paths.filter(p => !prior.changed_paths.includes(p))].slice(0, 50),
     ancestry: prior.ancestry === 'rewritten' ? 'rewritten' : carry.ancestry,
