@@ -318,11 +318,14 @@ test('pack ships a linked worktree with a self-contained .git on the checked-out
       sh('git init -q --bare origin.git && git clone -q origin.git src 2>/dev/null && cd src && echo a > a && git add a && git commit -qm one && git push -q origin HEAD:main && echo b > b && git add b && git commit -qm two && git push -q origin HEAD:main && git checkout -q --detach && echo c > c && echo s > staged && git add staged && echo i > inta && git add -N inta', d);
       const src = join(d, 'src');
       const pack = `bash ${JSON.stringify(join(DIR, 'ubi-runner.sh'))} pack .`;
-      // Twenty seconds of index.lock, worktree and ref churn in the checkout while pack runs three times.
-      const churn = Bun.spawn(['bash', '-c', 'end=$((SECONDS+20)); while [ $SECONDS -lt $end ]; do git update-index -q --refresh; git worktree add -q ../wt HEAD >/dev/null 2>&1; git worktree remove --force ../wt >/dev/null 2>&1; git update-ref refs/heads/churn HEAD; git update-ref -d refs/heads/churn; done'], { cwd: src, stdout: 'ignore', stderr: 'ignore' });
+      // Twenty seconds of index.lock, worktree and ref churn in the checkout while pack runs three times. The forced
+      // write renames a new index over the live one on every pass; GNU cp refused such an index mid-swap and failed the pack.
+      const churn = Bun.spawn(['bash', '-c', 'end=$((SECONDS+20)); while [ $SECONDS -lt $end ]; do git update-index -q --refresh --force-write-index; git worktree add -q ../wt HEAD >/dev/null 2>&1; git worktree remove --force ../wt >/dev/null 2>&1; git update-ref refs/heads/churn HEAD; git update-ref -d refs/heads/churn; done'], { cwd: src, stdout: 'ignore', stderr: 'ignore' });
       try {
         for (const i of [1, 2, 3]) sh(`${pack} > ../pack-${i}.tgz`, src);
       } finally { churn.kill(); }
+      // Every snapshot taken under the churn carries a whole index that git can read.
+      for (const i of [1, 2]) sh(`mkdir vm-${i} && tar -xzf pack-${i}.tgz -C vm-${i} && cd vm-${i} && git ls-files -s >/dev/null && git status --short >/dev/null`, d);
       sh('mkdir vm && tar -xzf pack-3.tgz -C vm', d);
       const vm = join(d, 'vm');
       expect(lstatSync(join(vm, '.git')).isDirectory()).toBe(true);
@@ -339,6 +342,7 @@ test('pack ships a linked worktree with a self-contained .git on the checked-out
       sh('mkdir ../tmpd && git checkout -q -b topic && git branch -q --set-upstream-to=origin/main topic', src);
       const broken = Bun.spawnSync(['bash', '-c', `rm -f .git/index && TMPDIR=../tmpd ${pack} > ../pack-broken.tgz; echo rc=$?; ls ../tmpd`], { cwd: src, timeout: 60_000 });
       expect(broken.stderr.toString()).toContain('.git/index');
+      expect(broken.stderr.toString()).toContain('pack: could not copy the index of');
       expect(broken.stdout.toString().trim()).toBe('rc=1');
       // A gitlink in the index (a submodule commit this object store lacks) is not packed, and a valueless
       // remote key (`[remote "origin"] mirror`) replays as true.
