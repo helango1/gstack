@@ -636,7 +636,7 @@ function cmdCarry(rest: string[], json: boolean): number {
   const line = receiptSummaryLine(carried);
   if (rest.includes('--dry-run')) {
     process.stderr.write(line + '\n');
-    process.stdout.write(json ? JSON.stringify({ skill: 'ship', status: 'dry-run', head, carry: plan.carry }) + '\n' : `CARRY: would carry from ${from.slice(0, 12)} to ${head.slice(0, 12)} (${plan.carry.reason}); nothing written\n`);
+    process.stdout.write(json ? JSON.stringify({ skill: 'ship', status: 'dry-run', head, carry: { ...plan.carry, covers: carried.carry!.covers } }) + '\n' : `CARRY: would carry from ${from.slice(0, 12)} to ${head.slice(0, 12)} (${plan.carry.reason}); nothing written\n`);
     return EXIT.ok;
   }
   if (bodyFile) fs.writeFileSync(bodyFile, newBody);

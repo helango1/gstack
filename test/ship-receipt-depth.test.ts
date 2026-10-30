@@ -169,10 +169,11 @@ describe('carry and the review depth', () => {
     expect(codeCovers.join('\n')).toContain('light depth (core checklist and one batched specialist)');
   }, 90_000);
 
-  // Value: protects=a receipt carried twice keeps the covers of the review that ran, and a carry written before covers
-  // followed the depth is read as no depth recorded; fails_when=the second hop derives covers from the review_depth the
-  // first hop rebound to its head (an e2e file counts runtime lines, not product), so a docs-only review claims the
-  // adversarial review, or an inherited fixed list keeps claiming it; seam=none
+  // Value: protects=a receipt carried twice keeps the covers of the review that ran (in the written receipt and the
+  // --dry-run --json report), and a carry written before covers followed the depth is read as no depth recorded;
+  // fails_when=the second hop derives covers from the review_depth the first hop rebound to its head (an e2e file counts
+  // runtime lines, not product), so a docs-only review claims the adversarial review, or an inherited fixed list keeps
+  // claiming it; seam=none
   test('a second carry keeps the first carry covers; an inherited fixed list reads as no depth recorded', () => {
     const repo = makeFixtureRepo(); repos.push(repo);
     commit(repo, { 'docs/guide.md': '# Guide\n' });
@@ -185,6 +186,9 @@ describe('carry and the review depth', () => {
     const firstCovers = first.carry!.covers;
     expect(firstCovers).not.toContain('adversarial review');
     commit(repo, { 'test/guide.test.js': "test('a', () => {});\n" });
+    const dry = runBin(repo, 'gstack-ship-receipt', ['carry', '--body', body, '--base', 'main', '--dry-run', '--json']);
+    expect(dry.status).toBe(EXIT.ok);
+    expect(JSON.parse(dry.out.trim().split('\n').pop()!).carry.covers).toEqual(firstCovers);
     expect(runBin(repo, 'gstack-ship-receipt', ['carry', '--body', body, '--base', 'main']).status).toBe(EXIT.ok);
     expect(receiptIn(body).carry!.covers).toEqual(firstCovers);
 
