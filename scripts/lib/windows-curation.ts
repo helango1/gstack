@@ -322,7 +322,7 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
   // The budget is measured on Linux; the queue is a controller command run on Linux and macOS.
   {
     file: 'test/ship-queue-recompute-budget.test.ts',
-    reason: 'wall-clock budget on a recompute that spawns git and bin/gstack-diff-scope per PR; subprocess-heavy pregate and ship tests run 12-24x slower on windows-latest than on Linux (free-test-durations-windows.json), past the 5,000 ms budget',
+    reason: 'wall-clock budget on a recompute that spawns git and bin/gstack-diff-scope per PR; subprocess-heavy pregate and ship tests run 12-24x slower on windows-latest than on Linux (free-test-durations-windows.json), which projects this 200 ms pass to reach or pass the 5,000 ms budget',
   },
 ];
 

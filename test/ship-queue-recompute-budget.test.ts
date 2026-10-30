@@ -5,7 +5,8 @@
  * scope from git, so a recompute that grows with the diff stalls every train.
  * The train spans the observed PR sizes of the last 300 upstream merges
  * (median 14 files / 444 lines, p90 52 / 3,002, max 490 / 33,352) and puts its
- * last PR above the observed maximum.
+ * last PR above the observed maximum. The budget catches stalls, not 3-4x
+ * slowdowns, and it covers diff size, not repo size.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
@@ -31,7 +32,7 @@ const fileText = (ext: string, tag: string, n: number) => Array.from({ length: n
 
 describe('the queue recomputes a five-PR train within a fixed budget', () => {
   // Value: protects=READY and train build recompute every receipt's needed depth without stalling the train on a large diff;
-  //   fails_when=the recompute adds per-file or per-line subprocesses, a quadratic pass or a scan that runs to its 60 s timeout;
+  //   fails_when=the recompute adds per-line subprocesses, a diff-scope or gate scan per file, a quadratic pass or a 60 s scan timeout;
   //   why_new=ship-receipt-depth.test.ts checks the verdicts, never their cost; seam=bindShippedReceipt
   test('one pass over PRs of 3 to 500 files binds every receipt at its required depth inside the budget', () => {
     const repo = makeFixtureRepo({ prefix: 'gstack-recompute-budget-' }); repos.push(repo);
