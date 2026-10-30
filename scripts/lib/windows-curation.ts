@@ -319,6 +319,11 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     file: 'test/restamp-gate-ahead-changelog.test.ts',
     reason: 'spawns bin/gstack-restamp (shebang) and a POSIX release tool through test/helpers/restamp-fixture.ts',
   },
+  // The budget is measured on Linux; the queue is a controller command run on Linux and macOS.
+  {
+    file: 'test/ship-queue-recompute-budget.test.ts',
+    reason: 'wall-clock budget on a recompute that spawns git and bin/gstack-diff-scope per PR; subprocess-heavy pregate and ship tests run 12-24x slower on windows-latest than on Linux (free-test-durations-windows.json), past the 5,000 ms budget',
+  },
 ];
 
 // Force-include overrides: files a WINDOWS_FRAGILE_PATTERNS regex excludes for
