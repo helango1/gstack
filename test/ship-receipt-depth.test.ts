@@ -10,7 +10,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { EXIT } from '../lib/headless-artifacts';
-import { extractReceipt, renderReceiptBlock } from '../lib/ship-receipt';
+import { carryCovers, extractReceipt, planCarry, planTreeCarry, renderReceiptBlock } from '../lib/ship-receipt';
 import { bindShippedReceipt, receiptDepthVerdict, reviewLoopExceptionLine } from '../lib/ship-receipt-depth';
 import { cleanup, commit, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
 
@@ -141,6 +141,58 @@ describe('carry and the review depth', () => {
     expect(refused.err).toContain("above the receipt's light");
     expect(receiptIn(body).head).toBe(plain);
   }, 90_000);
+
+  // Value: protects=a carried receipt claims only the checks its recorded review depth ran; fails_when=a light review with
+  // no runtime lines (no adversarial pass) carries a covers list that claims the adversarial review, or a light code
+  // review's carry stops naming its depth; seam=none
+  test('carry covers follow the recorded depth: light docs-only claims no adversarial review, light code claims it', () => {
+    const docs = makeFixtureRepo(); repos.push(docs);
+    commit(docs, { 'docs/guide.md': '# Guide\n' });
+    const docsBody = path.join(docs.root, 'body.md');
+    expect(writeReceipt(docs, docsBody).status).toBe(EXIT.ok);
+    expect(receiptIn(docsBody).review_depth).toMatchObject({ depth: 'light', runtime_lines: 0 });
+    commit(docs, { 'test/guide.test.js': "test('a', () => {});\n" });
+    expect(runBin(docs, 'gstack-ship-receipt', ['carry', '--body', docsBody, '--base', 'main']).status).toBe(EXIT.ok);
+    const docsCovers = receiptIn(docsBody).carry!.covers;
+    expect(docsCovers).not.toContain('adversarial review');
+    expect(docsCovers.join('\n')).toContain('light depth (core checklist only)');
+    expect(docsCovers).toEqual(expect.arrayContaining(['gate integrity', 'documentation audit']));
+
+    const code = makeFixtureRepo(); repos.push(code);
+    commit(code, { 'lib/util.js': lines(3), 'test/util.test.js': "test('a', () => {});\n" });
+    const codeBody = path.join(code.root, 'body.md');
+    expect(writeReceipt(code, codeBody).status).toBe(EXIT.ok);
+    commit(code, { 'test/util.test.js': "test('a', () => {});\ntest('b', () => {});\n" });
+    expect(runBin(code, 'gstack-ship-receipt', ['carry', '--body', codeBody, '--base', 'main']).status).toBe(EXIT.ok);
+    const codeCovers = receiptIn(codeBody).carry!.covers;
+    expect(codeCovers).toContain('adversarial review');
+    expect(codeCovers.join('\n')).toContain('light depth (core checklist and one batched specialist)');
+  }, 90_000);
+
+  // Value: protects=both carry planners claim the adversarial review only for a depth whose pass 1 runs it
+  // (docs/review-policy.md#review-depth), and a receipt without a depth claims no pass a depth would name;
+  // fails_when=covers ignores the depth, standard docs/tests or light runtime 0 claims the adversarial review, or a
+  // tree carry derives covers differently from a linear one; seam=none
+  test('covers per depth for a linear and a rewritten carry', () => {
+    const depth = (d: 'light' | 'standard' | 'full', cls: 'docs' | 'tests' | 'code' | 'gate', runtime: number) =>
+      ({ depth: d, class: cls, runtime_lines: runtime, rules: 'r', base: 'b', registry: null, gate_scan: { tagged: 0, head: 'h' }, reasons: [] });
+    const linear = (d?: ReturnType<typeof depth>) => planCarry({ from: 'a'.repeat(40), head: 'b'.repeat(40), changed: [], productPatchId: { from: 'p', head: 'p' }, testPatchId: { from: '', head: '' }, changedProduct: [], mergeCommits: 0, rangeDiff: '', depth: d });
+    const tree = (d?: ReturnType<typeof depth>) => planTreeCarry({ from: 'a'.repeat(40), head: 'b'.repeat(40), headTree: 't', coveredTrees: ['t'], productPatchId: { recorded: 'p', head: 'p' }, depth: d });
+    const cases: Array<[ReturnType<typeof depth> | undefined, string, boolean]> = [
+      [depth('light', 'docs', 0), 'pre-landing review at light depth (core checklist only)', false],
+      [depth('light', 'code', 12), 'pre-landing review at light depth (core checklist and one batched specialist)', true],
+      [depth('standard', 'code', 80), 'pre-landing review at standard depth (specialists and Red Team by runtime-line thresholds)', true],
+      [depth('standard', 'tests', 0), 'pre-landing review at standard depth (specialists and Red Team by runtime-line thresholds)', false],
+      [depth('full', 'gate', 3), 'pre-landing review at full depth (every specialist and the Red Team)', true],
+      [undefined, 'pre-landing review (depth not recorded)', false],
+    ];
+    for (const [d, review, adversarial] of cases) {
+      const want = [review, ...(adversarial ? ['adversarial review'] : []), 'gate integrity', 'documentation audit'];
+      expect(carryCovers(d)).toEqual(want);
+      expect(linear(d)).toMatchObject({ ok: true, carry: { covers: want } });
+      expect(tree(d)).toMatchObject({ ok: true, carry: { covers: want } });
+    }
+  });
 
   // Value: protects=a carry never binds a scan of one checkout to another commit, and never rebinds a receipt the queue would
   // refuse; fails_when=carry --head from another checkout carries a skipped test at light, or a current receipt without
