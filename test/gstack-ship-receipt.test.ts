@@ -318,7 +318,7 @@ describe('gstack-ship-receipt carry (harness lane E row 3: receipt follows a hea
     const after = extractReceipt(fs.readFileSync(body, 'utf8'));
     expect(after.errors).toEqual([]);
     expect(after.receipt).toMatchObject({ pr: 5, head, base: 'main', review_loop: { passes: 2 } });
-    expect(after.receipt!.carry).toMatchObject({ from: reviewed, reason: 'base merge + test-only change', merge_commits: 1, covers: ['pre-landing review', 'adversarial review', 'gate integrity', 'documentation audit'] });
+    expect(after.receipt!.carry).toMatchObject({ from: reviewed, reason: 'base merge + test-only change', merge_commits: 1, covers: ['pre-landing review (depth not recorded)', 'gate integrity', 'documentation audit'] });
     expect(after.receipt!.carry!.product_patch_id).toMatch(/^[0-9a-f]{40}$/);
     expect(after.receipt!.carry!.changed_paths.sort()).toEqual(['product:src/other.ts', 'test:test/app.test.ts']);
     expect(after.receipt!.carry!.range_diff).not.toMatch(/^unavailable/);

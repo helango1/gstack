@@ -554,7 +554,7 @@ function cmdCarry(rest: string[], json: boolean): number {
     // Rewritten history: the receipt follows only onto a tree it already covers, with the product diff it recorded.
     const recorded = receipt.product_patch_id !== undefined ? (receipt.product_patch_id === 'none' ? '' : receipt.product_patch_id) : fromKnown ? productPatchAgainstBase(repoRoot, rules, baseRef, from) : { error: 'the receipt records no product patch-id and its head is not in this clone' };
     if (typeof recorded !== 'string') return refused('RECEIPT_CARRY_REFUSED', `the reviewed product patch-id is unavailable: ${recorded.error}; run /ship on ${head.slice(0, 12)}`);
-    plan = planTreeCarry({ from, head, headTree, coveredTrees: covered, productPatchId: { recorded, head: headPatch } });
+    plan = planTreeCarry({ from, head, headTree, coveredTrees: covered, productPatchId: { recorded, head: headPatch }, depth: receipt.review_depth });
   } else {
     const fromBase = git(['merge-base', baseRef, from], repoRoot);
     if (!fromBase) return refused('RECEIPT_CARRY_REFUSED', `cannot resolve the merge base of ${baseRef} (fetch it first)`);
@@ -599,7 +599,7 @@ function cmdCarry(rest: string[], json: boolean): number {
     // Evidence for the record, never the decision: a slow range-diff is reported unavailable rather than waited for.
     const rangeRaw = spawnSync('git', ['range-diff', '--no-color', `${fromBase}..${from}`, `${headBase}..${head}`], { cwd: repoRoot, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024 * 1024 });
     const rangeDiff = rangeRaw.status === 0 ? (rangeRaw.stdout.trim().split('\n').slice(0, 20).join('\n') || '(empty: identical ranges)') : `unavailable: ${(rangeRaw.stderr ?? '').trim().split('\n')[0] || (rangeRaw.signal ? `range-diff killed by ${rangeRaw.signal} after 15 s` : 'range-diff failed')}`;
-    plan = planCarry({ from, head, changed, productPatchId: { from: reviewed as string, head: current as string }, testPatchId: { from: testFrom, head: testHead }, changedProduct, mergeCommits: Number(mergeCommits) || 0, rangeDiff, ...(retarget ? { retargetedFrom: reviewedBase } : {}) });
+    plan = planCarry({ from, head, changed, productPatchId: { from: reviewed as string, head: current as string }, testPatchId: { from: testFrom, head: testHead }, changedProduct, mergeCommits: Number(mergeCommits) || 0, rangeDiff, ...(retarget ? { retargetedFrom: reviewedBase } : {}), depth: receipt.review_depth });
   }
   if (!plan.ok) return refused(plan.code, plan.message);
   // Eligibility is not publication: a receipt that recorded a pregate is rebound only with a pregate current for HEAD,
@@ -636,7 +636,7 @@ function cmdCarry(rest: string[], json: boolean): number {
   const line = receiptSummaryLine(carried);
   if (rest.includes('--dry-run')) {
     process.stderr.write(line + '\n');
-    process.stdout.write(json ? JSON.stringify({ skill: 'ship', status: 'dry-run', head, carry: plan.carry }) + '\n' : `CARRY: would carry from ${from.slice(0, 12)} to ${head.slice(0, 12)} (${plan.carry.reason}); nothing written\n`);
+    process.stdout.write(json ? JSON.stringify({ skill: 'ship', status: 'dry-run', head, carry: { ...plan.carry, covers: carried.carry!.covers } }) + '\n' : `CARRY: would carry from ${from.slice(0, 12)} to ${head.slice(0, 12)} (${plan.carry.reason}); nothing written\n`);
     return EXIT.ok;
   }
   if (bodyFile) fs.writeFileSync(bodyFile, newBody);
