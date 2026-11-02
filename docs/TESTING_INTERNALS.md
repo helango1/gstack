@@ -1474,6 +1474,10 @@ from this file-level ledger.
 The aggregate job of `free-tests.yml` downloads every `flake-ledger-*` artifact
 of the run and appends `bun run scripts/test-health-report.ts flake-summary <dir>`
 to its job summary. The Windows lane uploads `flake-ledger-windows-<shard>`.
+The weekly report's `windows-nightly` metric reads the scheduled
+`windows-free-tests.yml` runs on main: their conclusions, the latest run's
+link, each red run's link, and the files with a flaky pass in those ledgers.
+It is report-only, so it never fails the run or opens the tracking issue.
 
 Free-suite flake rules:
 

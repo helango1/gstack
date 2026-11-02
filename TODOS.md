@@ -19,7 +19,6 @@
 
 ### P2/P3: Windows smoke follow-ups (filed 2026-11-01, from the GSTA-203 PR 1 /ship review)
 - **Branches cut before windows-smoke.yml still owe the old Windows lane (P2)** — pregate reads lanes from the branch's own workflows, so such a branch keeps an uncleared `windows-free-tests.yml/windows-free-shard` obligation, and `ready --dispatch-ci` skips `windows-smoke.yml` there. The lane clears it by passing `windows-free-tests.yml` to `--dispatch-ci` (the old cost) or with a main-merge grant. Have the skip note name that route, or dispatch the old workflow in smoke's place. The skip also treats a branch that deletes or renames `windows-smoke.yml` as one that predates it; check the merge base too. **Effort:** S. **Priority:** P2.
-- **Someone owns the nightly (P2)** — nothing reads the scheduled `windows-free-tests.yml` result or its flake ledgers. Add a test-health-report metric for scheduled runs on main, or have the daily flaky pass read the latest nightly. **Effort:** S. **Priority:** P2.
 - **Smoke /browse step waits for its page server (P3)** — `windows-smoke.yml` starts `Bun.serve` in the background and calls `browse chain goto` right away; poll the port first. **Effort:** XS. **Priority:** P3.
 - **Smoke seed ceiling vs the weekly reseed (P3)** — `test/windows-native-workflows.test.ts` holds each smoke file to 5 s in the Windows seed, which `free-durations-record.yml` rewrites weekly; one slow recording turns the seed PR red. Report the overrun there or re-pick files at reseed. **Effort:** S. **Priority:** P3.
 
@@ -5567,4 +5566,3 @@ Garry for each; revisit 2026-10-29 unless a date says otherwise.
   GSTA-134's pilot reports into account. /retro (41 KB template) is the largest outside GSTA-134's three.
 - **P3 — move the /learn eval onto the shared skill eval** (`docs/designs/SKILL_EVAL_CONTRACT.md`) once GSTA-2 ships it,
   and drop the interim upstream `eval.mjs` path from `write-skill/references/diet.md`.
-
