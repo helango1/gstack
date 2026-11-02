@@ -17,6 +17,7 @@ Homes are paths in the gstack checkout the lane checked at session start.
 | `REQUIRED_CHECKS` | `<check names that must be green at a READY head>` |
 | `FULL_GATE_CHECK` | `<the check the train gate publishes>` |
 | `TRAIN_MAX`, `FILL_HOURS` | `<5>`, `<3>` |
+| `WAVE_TRIGGER` | `<6>` (READY PRs over this run `wave plan` and travel as wave PRs of 3–6) |
 | `MERGE_METHOD` | `<squash \| merge>` |
 | `STAMP_FILES` | `<VERSION, package.json, CHANGELOG.md, …>` |
 | `KNOWN_INFRA_FLAKES` | `<named jobs a lane may rerun once per PR, or none>` |
@@ -133,7 +134,9 @@ Homes are paths in the gstack checkout the lane checked at session start.
     answered into the run and it reports `APPROVED`; record it with `gstack-approvals
     import --autoplan`. New scope taken on part-way gets the same. Exempt: read-only
     lanes, the daily flaky pass's repairs, slot stamps, CHANGELOG-only resolves, cap
-    re-pins under a written grant. Home: `docs/captain.md` (Plan before build),
+    re-pins under a written grant, S1 emergencies (broken install or upgrade, red main,
+    a security bug) and fixes from an already-diagnosed, audited problem list; every
+    other fix gets a one-round, eng-only plan. Home: `docs/captain.md` (Plan before build),
     `captain/templates/brief.md`.
 
 ## Crew-specific rules

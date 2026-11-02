@@ -33,18 +33,34 @@ describe('gstack-review-plan', () => {
     const r = run(repo({ 'docs/bench.md': 'Median latency fell 42% to 180 ms.\n' }), []);
     expect(r.stdout).toContain('DISPATCH: outside-voice outside-voice effort=host');
   });
-  test('--json carries the class, the next step, every dispatch with its effort and the audit effort; --no-tiers renders audits at host effort', () => {
+  test('--json carries the class, the next step, every dispatch with its effort and the audit effort; --no-tiers renders specialists and audits at host effort', () => {
     const r = repo({ 'src/a.ts': Array.from({ length: 80 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n' });
-    const plan = JSON.parse(run(r, ['--json']).stdout);
+    const plan = JSON.parse(run(r, ['--json', '--depth-floor', 'standard']).stdout);
     expect(plan).toMatchObject({ class: 'code', next: { step: 'full' }, pass: 0 });
-    expect(plan.dispatches.find((d: any) => d.role === 'specialist').effort).toBe('full');
+    expect(plan.dispatches.filter((d: any) => d.role === 'specialist').map((d: any) => d.effort)).toEqual(expect.arrayContaining(['medium']));
+    expect(plan.dispatches.filter((d: any) => d.role === 'specialist').every((d: any) => d.effort === 'medium')).toBe(true);
+    expect(plan.dispatches.find((d: any) => d.role === 'adversarial-native').effort).toBe('full');
     expect(plan.audit_effort).toBe('light');
-    expect(JSON.parse(run(r, ['--json', '--no-tiers']).stdout).audit_effort).toBe('host');
+    expect(run(r, ['--depth-floor', 'standard']).stdout).toContain('DISPATCH: specialist batched effort=medium checklists=testing,security,state-machines');
+    const host = JSON.parse(run(r, ['--json', '--no-tiers', '--depth-floor', 'standard']).stdout);
+    expect(host.audit_effort).toBe('host');
+    expect(host.dispatches.filter((d: any) => d.role === 'specialist').every((d: any) => d.effort === 'host')).toBe(true);
+    expect(host.dispatches.find((d: any) => d.role === 'adversarial-native').effort).toBe('full');
+    expect(run(r, ['--no-tiers', '--depth-floor', 'standard']).stdout).toContain('DISPATCH: specialist batched effort=host checklists=testing,security,state-machines');
   });
   test('a below-floor fix after pass 1 plans one fix-check', () => {
     const r = run(repo({ 'src/a.ts': 'export const a = 1;\n' }), ['--pass', '1', '--last', 'full', '--fixed-below']);
     expect(r.stdout).toContain('next=fix-check dispatches=1');
     expect(r.stdout).toContain('DISPATCH: fix-check fix-check effort=full');
+  });
+  // Value: protects=the CLI the ship loop calls after a fix-check prints NEXT: done when the fix-check was clean and only below-floor fixes came before it; fails_when=`--last fix-check --fixed-below` prints NEXT: stop with a blocking-finding reason (GSTA-167 replay 8G on #34);
+  //   why_new=no CLI case covered --last fix-check; seam=bin/gstack-review-plan (lib/review-depth.ts stays at its no-loss pin); no_claim=the fix-check reviewer's verdict
+  test('a clean fix-check after below-floor fixes prints NEXT: done', () => {
+    const r = run(repo({ 'src/a.ts': 'export const a = 1;\n' }), ['--pass', '1', '--last', 'fix-check', '--fixed-below']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('NEXT: done');
+    expect(r.stdout).not.toContain('NEXT: stop');
+    expect(run(repo({ 'src/a.ts': 'export const a = 1;\n' }), ['--pass', '1', '--last', 'fix-check', '--fixed-below', '--blocking-open']).stdout).toContain('NEXT: stop');
   });
   test('--fix-check-prompt renders the fix-check reviewer prompt from the parent\'s files and refuses a missing one', () => {
     const r = repo({ 'docs/howto.md': '# x\n' });
@@ -116,32 +132,32 @@ describe('gstack-review-plan: review depth', () => {
     const r = repo({ 'src/a.ts': code(10), 'test/a.test.ts': code(200) });
     const out = run(r, []).stdout;
     const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: r.dir, encoding: 'utf8', timeout: 10_000 }).stdout.trim();
-    expect(out).toMatch(/^REVIEW_DEPTH: light runtime_lines=10 rules=[0-9a-f]{16} reasons=runtime=10<=50 codes=none$/m);
+    expect(out).toMatch(/^REVIEW_DEPTH: light runtime_lines=10 rules=[0-9a-f]{16} reasons=runtime=10 codes=none$/m);
     expect(out).toContain(`GATE_SCAN: tagged=0 head=${head}`);
-    expect(out).toContain('DISPATCH: specialist batched effort=full checklists=testing,maintainability,security,performance,state-machines,red-team');
+    expect(out).toContain('DISPATCH: specialist batched effort=full checklists=testing,security,state-machines,red-team');
     expect(out).toContain('DISPATCH: adversarial-native adversarial effort=full reason=backtest inconclusive (GSTA-147 D5)');
   });
   test('DIFF_CMD is shell-quoted per dispatch and excludes what the reviewer does not read; DIFF_EXCLUDE: none when empty', () => {
     const r = repo({ 'src/a.ts': code(80), 'docs/my notes*.md': '# n\n', 'test/a.test.ts': code(3) });
     const out = run(r, []).stdout;
-    expect(out).toContain("DIFF_CMD: testing git diff <diff-base> -- . ':(exclude,literal)docs/my notes*.md'");
-    expect(out).toContain("DIFF_CMD: maintainability git diff <diff-base> -- . ':(exclude,literal)docs/my notes*.md' ':(exclude)test/a.test.ts'");
+    expect(out).toContain("DIFF_CMD: batched git diff <diff-base> -- . ':(exclude,literal)docs/my notes*.md'\n");
+    expect(out).toContain('SKIP: maintainability, performance, simplification (lean ensemble: read only when forced)');
     expect(out).toContain('DIFF_CMD: adversarial git diff <diff-base>\nDIFF_EXCLUDE: adversarial none');
-    const cmd = /^DIFF_CMD: maintainability (.*)$/m.exec(out)![1]!.replace('<diff-base>', 'main');
+    const cmd = /^DIFF_CMD: batched (.*)$/m.exec(out)![1]!.replace('<diff-base>', 'main');
     const diff = spawnSync('bash', ['-c', cmd.replace('git diff main', 'git diff --name-only main')], { cwd: r.dir, encoding: 'utf8' });
-    expect(diff.stdout.trim().split('\n')).toEqual(['src/a.ts']);
+    expect(diff.stdout.trim().split('\n')).toEqual(['src/a.ts', 'test/a.test.ts']);
   });
   test('--json carries depth, runtime_lines, rules, errors, gate_scan and every dispatch\'s exclude array', () => {
     const r = repo({ 'src/a.ts': code(80), 'README.md': '# y\n' });
-    const plan = JSON.parse(run(r, ['--json']).stdout);
+    const plan = JSON.parse(run(r, ['--json', '--depth-floor', 'standard']).stdout);
     expect(plan).toMatchObject({ depth: 'standard', step_depth: 'standard', runtime_lines: 80, errors: [], codes: [], gate_scan: { tagged: 0 } });
     expect(plan.rules).toMatch(/^[0-9a-f]{16}$/);
-    expect(plan.dispatches.find((d: any) => d.name === 'maintainability').exclude).toEqual([':(exclude)README.md']);
+    expect(plan.dispatches.find((d: any) => d.name === 'batched').exclude).toEqual([':(exclude)README.md']);
     expect(plan.dispatches.find((d: any) => d.role === 'outside-voice').exclude).toEqual([]);
   });
   test('--depth-floor full raises a light diff, never lowers a full one, and an invalid floor is a usage error', () => {
     const r = repo({ 'src/a.ts': code(5) });
-    expect(run(r, ['--depth-floor', 'full']).stdout).toMatch(/^REVIEW_DEPTH: full runtime_lines=5 .*reasons=runtime=5<=50,floor:full /m);
+    expect(run(r, ['--depth-floor', 'full']).stdout).toMatch(/^REVIEW_DEPTH: full runtime_lines=5 .*reasons=runtime=5,floor:full /m);
     const gate = repo({ 'src/a.ts': code(5), '.github/workflows/ci.yml': 'on: push\n' });
     expect(run(gate, ['--depth-floor', 'standard']).stdout).toMatch(/^REVIEW_DEPTH: full /m);
     expect(run(r, ['--depth-floor', 'light']).status).toBe(2);
@@ -174,7 +190,7 @@ describe('gstack-review-plan: the scoped second pass (GSTA-152 D6)', () => {
     const out = run(r, [...pass2, '--range-base', rangeBase]).stdout;
     expect(out).toMatch(/^REVIEW_PLAN: class=code pass=2 next=scoped dispatches=3 /m);
     expect(out).toContain(`FIX_RANGE: runtime_lines=24 base=${rangeBase}`);
-    expect(out).toMatch(/^NEXT: scoped \(a blocking finding was fixed on a standard diff with 24 runtime lines in the fix range/m);
+    expect(out).toMatch(/^NEXT: scoped \(a blocking finding was fixed on a light diff with 24 runtime lines in the fix range/m);
     expect(out).toContain('DISPATCH: fix-check fix-check effort=full');
     expect(out).toContain('DISPATCH: red-team red-team effort=full');
     expect(out).toContain('DISPATCH: adversarial-native adversarial effort=full');
@@ -205,7 +221,7 @@ describe('gstack-review-plan: the scoped second pass (GSTA-152 D6)', () => {
     fs.writeFileSync(path.join(r.dir, 'src', 'b.ts'), code(2, 'b'));
     git('add', '.'); git('commit', '-qm', 'fix: revert the workflow edit');
     const out = run(r, [...pass2, '--range-base', rangeBase]).stdout;
-    expect(out).toMatch(/^REVIEW_DEPTH: standard /m);
+    expect(out).toMatch(/^REVIEW_DEPTH: light .* step=standard$/m);
     expect(out).toMatch(/^NEXT: full \(a blocking finding was fixed and a fix touched a gate-class path/m);
     expect(JSON.parse(run(r, [...pass2, '--range-base', rangeBase, '--json']).stdout)).toMatchObject({ next: { step: 'full' }, fix_range: { touched_gate: true } });
   }, 30_000);

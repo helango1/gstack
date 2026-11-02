@@ -9,7 +9,8 @@
  * of main free-tests runs over a window of at least 20 runs (W7a), and more
  * than 5 free test files missing from scripts/free-test-durations.json
  * (CEO-10). Without `--enforce` the command always exits 0; an unavailable
- * check never fails it. Needs `gh` with read access to the repository.
+ * check never fails it. The scheduled Windows nightly (windows-free-tests.yml)
+ * is a report-only metric. Needs `gh` with read access to the repository.
  *
  * Usage:
  *   bun run test:health [--since-days 7] [--json] [--enforce] [--summary <file>]
@@ -20,9 +21,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { GH_CLIENT, downloadRunArtifacts, formatFlakeSummary, historyFetcher, listRunJobs, listWorkflowRuns, readCiFlakeLedgers,
-  readFlakeLedgerDir, repoSlug, unavailableReason, type CiRun, type FlakeWindow, type GhClient } from './lib/ci-history';
+  rankFlakyFiles, readFlakeLedgerDir, repoSlug, unavailableReason, type CiRun, type FlakeWindow, type GhClient } from './lib/ci-history';
 import { analyzePassRates, readTrialOutcomeDir, type TrialRecord } from './eval-flake-rank';
-import { collectFreeTestFiles, loadFreeTestDurations, unseededFreeFiles } from './test-free-shards';
+import { collectFreeTestFiles, loadFreeTestDurations, unseededFreeFiles, type FlakeLedgerEntry } from './test-free-shards';
 import { EVAL_POLICY } from '../test/helpers/periodic-exclude-data';
 import { resolveStateRoot } from '../lib/state-root';
 
@@ -128,12 +129,18 @@ export function flakeCheck(window: FlakeWindow | Error): Check {
     fix: 'Fix the race at source (docs/TESTING_INTERNALS.md#flake-ledger); never raise the timeout or add a retry. Reproduce with `bun test <file>` under load.' };
   if (window instanceof Error) return { ...base, status: 'unavailable', detail: `unavailable: ${unavailableReason(window)}` };
   const failing = window.files.filter(file => file.failing);
+  const left = flakeWindowNotes(window);
   if (!window.enforceable) {
-    return { ...base, status: 'pass', detail: `report-only: ${window.runs} main run(s) since ${window.since.slice(0, 10)} (< 20 needed to enforce)` };
+    return { ...base, status: 'pass', detail: `report-only: ${window.runs} main run(s) since ${window.since.slice(0, 10)} (< 20 needed to enforce)${left}` };
   }
-  if (failing.length === 0) return { ...base, status: 'pass', detail: `no file above 5% over ${window.runs} main runs` };
+  if (failing.length === 0) return { ...base, status: 'pass', detail: `no file above 5% over ${window.runs} main runs${left}` };
   return { ...base, status: 'fail',
-    detail: failing.map(file => `${file.file}: flaky in ${file.flakyRuns}/${window.runs} main runs (${pct(file.rate)} > 5%)`).join('; ') };
+    detail: failing.map(file => `${file.file}: flaky in ${file.flakyRuns}/${window.runs} main runs (${pct(file.rate)} > 5%)`).join('; ') + left };
+}
+
+/** The reused main pushes a flake window left out and the runs it could not check, or ''. */
+function flakeWindowNotes(window: FlakeWindow): string {
+  return `${window.skipped ? `; ${window.skipped} reused main push(es) left out` : ''}${window.note ? `; ${window.note}` : ''}`;
 }
 
 export function unseededCheck(root: string): Check {
@@ -277,7 +284,7 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
     return { value: `${(total / 60_000 * 7 / sinceDays).toFixed(0)} min/week (${cancelled.length} cancelled run(s))` };
   }));
 
-  metrics.push(metric('push-to-verdict', 'PR lane push-to-verdict', 'created_at to updated_at of evals.yml pull_request runs that reached success or failure (includes queue and the readiness wait)', () => {
+  metrics.push(metric('push-to-verdict', 'PR lane push-to-verdict', 'created_at to updated_at of evals.yml pull_request runs that reached success or failure (includes queue and the readiness wait, which pr-summary runs skip since GSTA-149, so their verdicts land about 10 min sooner)', () => {
     const walls = need(prRuns).filter(run => run.conclusion === 'success' || run.conclusion === 'failure').map(run => span(run.createdAt, run.updatedAt)!);
     if (walls.length === 0) throw new Error('no PR run reached a verdict in the window');
     return { value: `p50 ${minutes(percentile(walls, 0.5))}, p95 ${minutes(percentile(walls, 0.95))} (${walls.length} runs)` };
@@ -286,20 +293,22 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
   metrics.push(...censusMetrics(inputs, artifactDirs));
 
   const flakes = attempt(() => readCiFlakeLedgers({ client, repo, sinceDays, now, cacheDir }));
-  metrics.push(metric('free-flaky-pass-rate', 'Free-suite flaky-pass rate', 'share of main free-tests runs (success or failure) with at least one flaky-pass ledger entry; per-file rate = runs with that file / runs', () => {
+  metrics.push(metric('free-flaky-pass-rate', 'Free-suite flaky-pass rate', 'share of main free-tests runs (success or failure) with at least one flaky-pass ledger entry; per-file rate = runs with that file / runs; a main push that reused its pull request\'s run (no artifacts, `reuse` job green) is left out', () => {
     const window = need(flakes);
-    return { value: `${pct(window.runs ? window.flakyRuns / window.runs : 0)} (${window.flakyRuns}/${window.runs} main runs since ${window.since.slice(0, 10)} needed the retry pass; ${window.files.length} file(s))`,
+    return { value: `${pct(window.runs ? window.flakyRuns / window.runs : 0)} (${window.flakyRuns}/${window.runs} main runs since ${window.since.slice(0, 10)} needed the retry pass; ${window.files.length} file(s)${flakeWindowNotes(window)})`,
       detail: window.files.slice(0, 15).map(file => `${file.file}: ${file.flakyRuns}/${window.runs} runs (${pct(file.rate)})${file.failing ? ' FAIL > 5%' : ''}`) };
   }));
 
-  metrics.push(metric('free-wall', 'Free-suite and Windows wall', 'p50 of run_started_at to updated_at for successful main runs of free-tests.yml and successful pull_request runs of windows-free-tests.yml (its workflow_dispatch duration recordings excluded)', () => {
+  metrics.push(metric('free-wall', 'Free-suite and Windows wall', 'p50 of run_started_at to updated_at for successful main runs of free-tests.yml and successful pull_request runs of windows-smoke.yml, the required Windows check (its workflow_dispatch runs excluded)', () => {
     const walls = (workflow: string, filter: { branch?: string; event?: string }) =>
       listWorkflowRuns(client, repo, workflow, { since, ...filter }).filter(run => run.conclusion === 'success').map(run => span(run.startedAt, run.updatedAt)!);
     const free = walls('free-tests.yml', { branch: 'main' });
-    const windows = walls('windows-free-tests.yml', { event: 'pull_request' });
+    const windows = walls('windows-smoke.yml', { event: 'pull_request' });
     const windowsValue = windows.length ? `${minutes(percentile(windows, 0.5))} (${windows.length} runs)` : 'no successful PR runs in window';
-    return { value: `free-tests ${minutes(percentile(free, 0.5))} (${free.length} runs); windows-free-tests (successful PR runs) ${windowsValue}` };
+    return { value: `free-tests ${minutes(percentile(free, 0.5))} (${free.length} runs); windows-smoke (successful PR runs) ${windowsValue}` };
   }));
+
+  metrics.push(windowsNightlyMetric(inputs, artifactDirs));
 
   metrics.push(metric('free-serial', 'Free-suite serial time', 'sum of scripts/free-test-durations.json (the committed seed)', () => {
     const durations = loadFreeTestDurations(root);
@@ -329,6 +338,34 @@ function listMergedPulls(client: GhClient, repo: string, since: string): number 
     if (pulls.length < 100 || pulls.every(pull => String(pull.updated_at) < since)) break;
   }
   return merged;
+}
+
+/**
+ * The scheduled Windows nightly (windows-free-tests.yml): conclusions, the
+ * latest run, red runs, and flaky passes across the window's finished runs,
+ * so a red night reaches the weekly summary. Report-only: no check reads it,
+ * so it never opens the tracking issue.
+ */
+function windowsNightlyMetric(inputs: HealthInputs, artifactDirs: (run: CiRun, match: (name: string) => boolean) => string[]): Metric {
+  const { client, repo, now, sinceDays } = inputs;
+  return metric('windows-nightly', 'Windows nightly (report-only)', 'scheduled runs of windows-free-tests.yml on main by conclusion, the latest one, and runs (success or failure) with a flaky-pass entry in their flake-ledger-windows-* artifacts; workflow_dispatch and branch runs excluded; reported, not an enforced check', () => {
+    const runs = listWorkflowRuns(client, repo, 'windows-free-tests.yml', { since: new Date(now - sinceDays * 86_400_000).toISOString(), branch: 'main', event: 'schedule' });
+    if (runs.length === 0) throw new Error('no scheduled windows-free-tests.yml run on main finished in the window');
+    const url = (run: CiRun) => `https://github.com/${repo}/actions/runs/${run.id}`;
+    const conclusions = new Map<string, number>();
+    for (const run of runs) conclusions.set(run.conclusion ?? 'none', (conclusions.get(run.conclusion ?? 'none') ?? 0) + 1);
+    const finished = runs.filter(run => run.conclusion === 'success' || run.conclusion === 'failure');
+    const ledgers = new Map<number, FlakeLedgerEntry[]>();
+    for (const run of finished) {
+      const entries = artifactDirs(run, name => name.startsWith('flake-ledger-windows-')).flatMap(readFlakeLedgerDir);
+      if (entries.length) ledgers.set(run.id, entries);
+    }
+    const flakes = rankFlakyFiles(ledgers, finished.length, runs[runs.length - 1].createdAt);
+    const latest = runs[0];
+    return { value: `${runs.length} run(s): ${[...conclusions].sort().map(([conclusion, count]) => `${count} ${conclusion}`).join(', ')}; latest ${latest.createdAt.slice(0, 10)} ${latest.conclusion ?? 'none'} ${url(latest)}; ${flakes.flakyRuns}/${finished.length} finished run(s) needed the retry pass`,
+      detail: [...runs.filter(run => run.conclusion !== 'success').map(run => `${run.conclusion ?? 'none'} ${run.createdAt.slice(0, 10)}: ${url(run)}`),
+        ...flakes.files.slice(0, 15).map(file => `flaky pass ${file.file}: ${file.flakyRuns}/${finished.length} runs`)] };
+  });
 }
 
 /**
