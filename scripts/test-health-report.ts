@@ -9,7 +9,8 @@
  * of main free-tests runs over a window of at least 20 runs (W7a), and more
  * than 5 free test files missing from scripts/free-test-durations.json
  * (CEO-10). Without `--enforce` the command always exits 0; an unavailable
- * check never fails it. Needs `gh` with read access to the repository.
+ * check never fails it. The scheduled Windows nightly (windows-free-tests.yml)
+ * is a report-only metric. Needs `gh` with read access to the repository.
  *
  * Usage:
  *   bun run test:health [--since-days 7] [--json] [--enforce] [--summary <file>]
@@ -20,9 +21,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { GH_CLIENT, downloadRunArtifacts, formatFlakeSummary, historyFetcher, listRunJobs, listWorkflowRuns, readCiFlakeLedgers,
-  readFlakeLedgerDir, repoSlug, unavailableReason, type CiRun, type FlakeWindow, type GhClient } from './lib/ci-history';
+  rankFlakyFiles, readFlakeLedgerDir, repoSlug, unavailableReason, type CiRun, type FlakeWindow, type GhClient } from './lib/ci-history';
 import { analyzePassRates, readTrialOutcomeDir, type TrialRecord } from './eval-flake-rank';
-import { collectFreeTestFiles, loadFreeTestDurations, unseededFreeFiles } from './test-free-shards';
+import { collectFreeTestFiles, loadFreeTestDurations, unseededFreeFiles, type FlakeLedgerEntry } from './test-free-shards';
 import { EVAL_POLICY } from '../test/helpers/periodic-exclude-data';
 import { resolveStateRoot } from '../lib/state-root';
 
@@ -307,6 +308,8 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
     return { value: `free-tests ${minutes(percentile(free, 0.5))} (${free.length} runs); windows-smoke (successful PR runs) ${windowsValue}` };
   }));
 
+  metrics.push(windowsNightlyMetric(inputs, artifactDirs));
+
   metrics.push(metric('free-serial', 'Free-suite serial time', 'sum of scripts/free-test-durations.json (the committed seed)', () => {
     const durations = loadFreeTestDurations(root);
     if (!durations) throw new Error('scripts/free-test-durations.json is missing or unreadable');
@@ -335,6 +338,33 @@ function listMergedPulls(client: GhClient, repo: string, since: string): number 
     if (pulls.length < 100 || pulls.every(pull => String(pull.updated_at) < since)) break;
   }
   return merged;
+}
+
+/**
+ * The scheduled Windows nightly (windows-free-tests.yml): conclusions, the
+ * latest run and its flaky passes, so a red night reaches the weekly summary.
+ * Report-only: no check reads it, so it never opens the tracking issue.
+ */
+function windowsNightlyMetric(inputs: HealthInputs, artifactDirs: (run: CiRun, match: (name: string) => boolean) => string[]): Metric {
+  const { client, repo, now, sinceDays } = inputs;
+  return metric('windows-nightly', 'Windows nightly (report-only)', 'scheduled runs of windows-free-tests.yml on main by conclusion, the latest one, and runs (success or failure) with a flaky-pass entry in their flake-ledger-windows-* artifacts; workflow_dispatch and branch runs excluded; reported, not an enforced check', () => {
+    const runs = listWorkflowRuns(client, repo, 'windows-free-tests.yml', { since: new Date(now - sinceDays * 86_400_000).toISOString(), branch: 'main', event: 'schedule' });
+    if (runs.length === 0) throw new Error('no scheduled windows-free-tests.yml run on main finished in the window');
+    const url = (run: CiRun) => `https://github.com/${repo}/actions/runs/${run.id}`;
+    const conclusions = new Map<string, number>();
+    for (const run of runs) conclusions.set(run.conclusion ?? 'none', (conclusions.get(run.conclusion ?? 'none') ?? 0) + 1);
+    const finished = runs.filter(run => run.conclusion === 'success' || run.conclusion === 'failure');
+    const ledgers = new Map<number, FlakeLedgerEntry[]>();
+    for (const run of finished) {
+      const entries = artifactDirs(run, name => name.startsWith('flake-ledger-windows-')).flatMap(readFlakeLedgerDir);
+      if (entries.length) ledgers.set(run.id, entries);
+    }
+    const flakes = rankFlakyFiles(ledgers, finished.length, runs[runs.length - 1].createdAt);
+    const latest = runs[0];
+    return { value: `${runs.length} run(s): ${[...conclusions].sort().map(([conclusion, count]) => `${count} ${conclusion}`).join(', ')}; latest ${latest.createdAt.slice(0, 10)} ${latest.conclusion ?? 'none'} ${url(latest)}; ${flakes.flakyRuns}/${finished.length} finished run(s) needed the retry pass`,
+      detail: [...runs.filter(run => run.conclusion !== 'success').map(run => `${run.conclusion ?? 'none'} ${run.createdAt.slice(0, 10)}: ${url(run)}`),
+        ...flakes.files.slice(0, 15).map(file => `flaky pass ${file.file}: ${file.flakyRuns}/${finished.length} runs`)] };
+  });
 }
 
 /**

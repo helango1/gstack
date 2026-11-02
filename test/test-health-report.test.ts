@@ -236,6 +236,8 @@ describe('collectHealth over recorded fixture data', () => {
       [/runs\/60\/artifacts/, () => ({ artifacts: [{ id: 61, name: 'flake-ledger-2', size_in_bytes: 10 }] })],
       [/runs\/61\/artifacts/, () => ({ artifacts: [{ id: 62, name: 'free-result-1', size_in_bytes: 10 }] })],
       [/workflows\/windows-smoke\.yml\/runs/, () => ({ workflow_runs: windowsRuns })],
+      [/workflows\/windows-free-tests\.yml\/runs/, () => ({ workflow_runs: [run(80, { event: 'schedule' })] })],
+      [/runs\/80\/artifacts/, () => ({ artifacts: [] })],
     ], {
       11: { 'manifest.json': JSON.stringify({ prCoverage: { mode: 'full-fallback', e2e: ['gate-a', 'gate-b'], judges: ['judge-a'],
         shadow: { e2e: ['gate-a', 'gate-b'], wouldDrop: [], wouldAdd: [], provenance: [], predictedSavingUsd: 0, unpricedCases: 0 } } }) },
@@ -266,6 +268,7 @@ describe('collectHealth over recorded fixture data', () => {
     expect(value('free-flaky-pass-rate').value).toStartWith('50.0% (1/2 main runs');
     expect(value('free-wall').value).toBe('free-tests 0.0 min (1 runs); windows-smoke (successful PR runs) 0.0 min (1 runs)');
     expect(value('free-serial').value).toBe('3 s over 3 files');
+    expect(value('windows-nightly').value).toBe('1 run(s): 1 success; latest 2026-10-04 success https://github.com/o/r/actions/runs/80; 0/1 finished run(s) needed the retry pass');
     for (const entry of report.metrics.filter(entry => entry.id !== 'net-complexity')) {
       expect(entry.rule.length).toBeGreaterThan(10);
       expect(entry.unavailable, entry.id).toBeUndefined();
@@ -337,6 +340,34 @@ describe('collectHealth over recorded fixture data', () => {
     expect(wall([run(73, { event: 'workflow_dispatch', run_started_at: day(3), updated_at: day(1) })]).value)
       .toBe('free-tests 0.0 min (1 runs); windows-smoke (successful PR runs) no successful PR runs in window');
     expect(wall([]).rule).toContain('workflow_dispatch runs excluded');
+  });
+
+  // Value: protects=a red scheduled Windows nightly reaching the weekly summary with its run URL, and its flaky passes counted;
+  // fails_when=the metric drops red runs, counts dispatch/branch runs, reports 0 for an empty window, or lets the nightly drive the issue;
+  // why_new=nothing read windows-free-tests.yml before (TODOS: someone owns the nightly); seam=GhClient fake; no_claim=GitHub's own filtering.
+  test('the Windows nightly metric reports scheduled main runs, surfaces red ones and their flaky passes, and never drives the issue', () => {
+    const nightly = (nightlyRuns: unknown[], artifacts: Record<number, unknown[]> = {}, zips: Record<number, Record<string, string>> = {}) => {
+      const client = fakeClient([
+        [/workflows\/windows-free-tests\.yml\/runs/, () => ({ workflow_runs: nightlyRuns })],
+        [/runs\/(\d+)\/artifacts/, apiPath => ({ artifacts: artifacts[Number(/runs\/(\d+)\/artifacts/.exec(apiPath)![1])] ?? [] })],
+        [/./, () => ({ workflow_runs: [] })],
+      ], zips);
+      return collectHealth({ client, repo: 'o/r', now: NOW, sinceDays: 7, cacheDir: tmp('health-cache-'), root: freeRoot(3, 0) });
+    };
+    const scheduled = (id: number, offset: number, extra: Record<string, unknown> = {}) => run(id, { event: 'schedule', created_at: day(offset), ...extra });
+    const report = nightly([scheduled(91, 1, { conclusion: 'failure' }), scheduled(92, 2), scheduled(93, 3, { conclusion: 'cancelled' }),
+      run(94, { event: 'workflow_dispatch', conclusion: 'failure' }), scheduled(95, 1, { head_branch: 'feature', conclusion: 'failure' })],
+    { 92: [{ id: 920, name: 'flake-ledger-windows-2', size_in_bytes: 10 }, { id: 921, name: 'free-result-2', size_in_bytes: 10 }] },
+    { 920: { 'flake-ledger.jsonl': ledger('test/win.test.ts') } });
+    const metric = report.metrics.find(entry => entry.id === 'windows-nightly')!;
+    expect(metric.value).toBe('3 run(s): 1 cancelled, 1 failure, 1 success; latest 2026-10-04 failure https://github.com/o/r/actions/runs/91; 1/2 finished run(s) needed the retry pass');
+    expect(metric.detail).toEqual(['failure 2026-10-04: https://github.com/o/r/actions/runs/91', 'cancelled 2026-10-02: https://github.com/o/r/actions/runs/93',
+      'flaky pass test/win.test.ts: 1/2 runs']);
+    expect(report.checks.map(check => check.id)).not.toContain('windows-nightly');
+
+    const empty = nightly([run(94, { event: 'workflow_dispatch' })]).metrics.find(entry => entry.id === 'windows-nightly')!;
+    expect(empty.value).toBeUndefined();
+    expect(empty.unavailable).toContain('no scheduled windows-free-tests.yml run on main finished in the window');
   });
 
   test('a rate-limited API degrades every remote metric to a named unavailable reason, never 0, and keeps the issue open', () => {
