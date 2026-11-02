@@ -357,13 +357,18 @@ describe('collectHealth over recorded fixture data', () => {
     const scheduled = (id: number, offset: number, extra: Record<string, unknown> = {}) => run(id, { event: 'schedule', created_at: day(offset), ...extra });
     const report = nightly([scheduled(91, 1, { conclusion: 'failure' }), scheduled(92, 2), scheduled(93, 3, { conclusion: 'cancelled' }),
       run(94, { event: 'workflow_dispatch', conclusion: 'failure' }), scheduled(95, 1, { head_branch: 'feature', conclusion: 'failure' })],
-    { 92: [{ id: 920, name: 'flake-ledger-windows-2', size_in_bytes: 10 }, { id: 921, name: 'free-result-2', size_in_bytes: 10 }] },
-    { 920: { 'flake-ledger.jsonl': ledger('test/win.test.ts') } });
+    { 91: [{ id: 910, name: 'flake-ledger-windows-1', size_in_bytes: 10 }],
+      92: [{ id: 920, name: 'flake-ledger-windows-2', size_in_bytes: 10 }, { id: 921, name: 'free-result-2', size_in_bytes: 10 }],
+      93: [{ id: 930, name: 'flake-ledger-windows-3', size_in_bytes: 10 }] },
+    { 910: { 'flake-ledger.jsonl': ledger('test/win.test.ts') }, 920: { 'flake-ledger.jsonl': ledger('test/win.test.ts') + ledger('test/other.test.ts') },
+      930: { 'flake-ledger.jsonl': ledger('test/cancelled.test.ts') } });
     const metric = report.metrics.find(entry => entry.id === 'windows-nightly')!;
-    expect(metric.value).toBe('3 run(s): 1 cancelled, 1 failure, 1 success; latest 2026-10-04 failure https://github.com/o/r/actions/runs/91; 1/2 finished run(s) needed the retry pass');
+    expect(metric.value).toBe('3 run(s): 1 cancelled, 1 failure, 1 success; latest 2026-10-04 failure https://github.com/o/r/actions/runs/91; 2/2 finished run(s) needed the retry pass');
     expect(metric.detail).toEqual(['failure 2026-10-04: https://github.com/o/r/actions/runs/91', 'cancelled 2026-10-02: https://github.com/o/r/actions/runs/93',
-      'flaky pass test/win.test.ts: 1/2 runs']);
-    expect(report.checks.map(check => check.id)).not.toContain('windows-nightly');
+      'flaky pass test/win.test.ts: 2/2 runs', 'flaky pass test/other.test.ts: 1/2 runs']);
+    // The enforced checks pass on these inputs, so a red nightly must leave the issue closed.
+    expect(report.checks.map(check => check.status)).toEqual(['pass', 'pass']);
+    expect(report.issueAction).toBe('close');
 
     const empty = nightly([run(94, { event: 'workflow_dispatch' })]).metrics.find(entry => entry.id === 'windows-nightly')!;
     expect(empty.value).toBeUndefined();

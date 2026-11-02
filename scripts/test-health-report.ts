@@ -342,8 +342,9 @@ function listMergedPulls(client: GhClient, repo: string, since: string): number 
 
 /**
  * The scheduled Windows nightly (windows-free-tests.yml): conclusions, the
- * latest run and its flaky passes, so a red night reaches the weekly summary.
- * Report-only: no check reads it, so it never opens the tracking issue.
+ * latest run, red runs, and flaky passes across the window's finished runs,
+ * so a red night reaches the weekly summary. Report-only: no check reads it,
+ * so it never opens the tracking issue.
  */
 function windowsNightlyMetric(inputs: HealthInputs, artifactDirs: (run: CiRun, match: (name: string) => boolean) => string[]): Metric {
   const { client, repo, now, sinceDays } = inputs;
