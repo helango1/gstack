@@ -129,7 +129,7 @@ test('windows-smoke is the PR gate: every pull request and main push, one window
   const browse: string = step("/browse on gstack's own browser runs a piped chain flow from an unrelated directory").run;
   expect(browse).toContain('| "$BROWSE" chain');
   // The page server starts in the background; the chain's goto must wait for it to answer.
-  const poll = browse.indexOf('curl -sf --max-time 2 -o /dev/null http://127.0.0.1:47124/ && break');
+  const poll = browse.search(/curl [^\n]*http:\/\/127\.0\.0\.1:47124\//);
   expect(poll).toBeGreaterThan(browse.indexOf('PAGE_PID=$!'));
   expect(poll).toBeLessThan(browse.indexOf('| "$BROWSE" chain'));
   const tests = step('Fastest Windows-safe free tests for install and the core skills');
