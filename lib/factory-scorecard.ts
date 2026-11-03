@@ -5,6 +5,13 @@
  * counting rule next to the number, and a line whose input cannot be read says
  * so ("unavailable: <reason>") instead of printing 0.
  *
+ * The window is [now - since-days, now): every input below counts an item only
+ * when its timestamp falls inside it (inWindow), so a past window does not
+ * count anything that happened after it. Attributes are read as they are now
+ * (a run's latest conclusion, an issue's latest closed_at, artifacts that have
+ * not expired). A merged-PR, gate-run or release read that runs past MAX_PAGES
+ * marks its line unavailable instead of printing a partial count.
+ *
  * Inputs, all REST reads (no write, no paid work):
  *   merged PRs           pulls?state=closed&base=<base>, merged_at inside the window;
  *                        crew = --crew logins, else author_association OWNER/MEMBER/COLLABORATOR
@@ -18,7 +25,8 @@
  *   flaky events         flake-records-a<n> artifacts of gate runs (paid, one record per case
  *                        that failed once and passed its one rerun) and flake-ledger-* artifacts
  *                        of <free workflow> runs on <base> (free-suite serial retries); the same
- *                        two sources the daily flaky pass reads
+ *                        two sources the daily flaky pass reads; a main push that reused its PR's
+ *                        run (no artifacts, `reuse` job green; reuseChecker) is left out
  *   issues               search/issues created / closed inside the window
  *   releases             releases published inside the window (drafts excluded)
  *
@@ -29,13 +37,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
-  GH_CLIENT, downloadRunArtifacts, filesUnder, historyFetcher, listWorkflowRuns, readFlakeLedgerDir, unavailableReason,
+  GH_CLIENT, createdFilter, downloadRunArtifacts, filesUnder, historyFetcher, listWorkflowRuns, readFlakeLedgerDir, reuseChecker, unavailableReason,
   type GhClient,
 } from '../scripts/lib/ci-history';
 
 export interface ScorecardSource {
   getJson(apiPath: string): unknown;
-  /** Downloaded, unzipped artifact directories of one run whose names match, keyed by artifact name; one listing per call. */
+  /** Downloaded, unzipped artifact directories of one run whose names match, keyed by artifact name; one listing per call, and `match` sees every name in it. */
   artifactDirs(runId: number, match: (name: string) => boolean): Map<string, string>;
 }
 
@@ -62,12 +70,13 @@ export interface ScorecardOptions {
 export const DEFAULTS = {
   base: 'main', sinceDays: 7, gateWorkflow: 'evals.yml', gateEvent: 'workflow_dispatch', freeWorkflow: 'free-tests.yml',
   trainPrefix: 'train/', readyMarker: 'READY #\\d+|SHIP_RECEIPT:|gstack-ship-receipt',
-  passMarker: '"passes"\\s*:\\s*(\\d+)|\\bpasses=(\\d+)|\\bREVIEW_PASS(?:ES)?[:= ]\\s*(\\d+)', passCap: 3, maxArtifactRuns: 60,
+  passMarker: '"passes"\\s*:\\s*(\\d+)|\\bpasses=(\\d+)|\\bREVIEW_PASS(?:ES)?[:= ]\\s*(\\d+)', passCap: 2, maxArtifactRuns: 60,
 } as const;
 
 export const CREW_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const PAGE = 100;
 const MAX_PAGES = 20;
+const pageCap = (what: string) => new Error(`${what} ran past ${MAX_PAGES} pages of ${PAGE}; a partial count is not reported`);
 const COST_LINE = /\*\*\$(\d+(?:\.\d+)?)\*\* rule\/judge cost|\bcost=\$(\d+(?:\.\d+)?)/g;
 
 export interface MergedPr {
@@ -85,12 +94,32 @@ export interface FreeRetryRun { id: number; conclusion: string | null; retries: 
 export interface Scorecard {
   repo: string; base: string; windowStart: string; windowEnd: string;
   prs: MergedPr[]; gates: GateRun[]; freeRuns: FreeRetryRun[]; artifactRunsRead: number; passCap: number;
+  /** Reused main pushes left out of freeRuns (reuseChecker), and the note naming runs it could not check. */
+  freeRunsSkipped: number; freeRunsNote: string | null;
   /** Gate runs whose artifacts could not be read; they count without cost or flake data. */
   artifactErrors: number;
   issuesOpened: number | null; issuesClosed: number | null; releases: Array<{ tag: string; publishedAt: string }>;
   unavailable: string[];
 }
 export interface ScorecardRow { id: string; metric: string; value: string; benchmark: string; rule: string }
+
+/** The scorecard's one window, [start, end) as ISO instants; every windowed read filters through inWindow. */
+export interface ScoreWindow { start: string; end: string }
+
+export function scoreWindow(o: Pick<ScorecardOptions, 'now' | 'sinceDays'>): ScoreWindow {
+  return { start: new Date(o.now - o.sinceDays * 86_400_000).toISOString(), end: new Date(o.now).toISOString() };
+}
+
+export function inWindow(at: unknown, w: ScoreWindow): boolean {
+  const t = typeof at === 'string' ? Date.parse(at) : NaN;
+  return t >= Date.parse(w.start) && t < Date.parse(w.end);
+}
+
+/** GitHub search's inclusive, whole-second range for the window: start rounded up, end one second before the next whole second at or after it. */
+export function searchRange(w: ScoreWindow): string {
+  const second = (ms: number) => new Date(Math.ceil(ms / 1000) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return `${second(Date.parse(w.start))}..${second(Math.ceil(Date.parse(w.end) / 1000) * 1000 - 1000)}`;
+}
 
 // --- Sources ---
 
@@ -140,14 +169,15 @@ function pullsPage(source: ScorecardSource, o: ScorecardOptions, page: number): 
 }
 
 /** Every PR merged into base inside the window; pages stop once a page's oldest update predates the window. */
-export function readMergedPrs(source: ScorecardSource, o: ScorecardOptions, since: string): MergedPr[] {
+export function readMergedPrs(source: ScorecardSource, o: ScorecardOptions, w: ScoreWindow): MergedPr[] {
   const out: MergedPr[] = [];
   const crewLogins = o.crew ? new Set(o.crew.map(l => l.toLowerCase())) : null;
-  for (let page = 1; page <= MAX_PAGES; page++) {
+  for (let page = 1; ; page++) {
+    if (page > MAX_PAGES) throw pageCap(`PRs updated since ${w.start}`);
     const pulls = pullsPage(source, o, page);
     for (const pr of pulls) {
       const mergedAt = typeof pr.merged_at === 'string' ? pr.merged_at : null;
-      if (!mergedAt || mergedAt < since) continue;
+      if (!mergedAt || !inWindow(mergedAt, w)) continue;
       const author = String(pr.user?.login ?? '');
       const association = String(pr.author_association ?? 'NONE');
       const comments = readComments(source, o.repo, Number(pr.number), { readyMarker: o.readyMarker, passMarker: o.passMarker, mergedAt });
@@ -158,7 +188,7 @@ export function readMergedPrs(source: ScorecardSource, o: ScorecardOptions, sinc
         passes: bodyPasses === null ? comments.passes : Math.max(bodyPasses, comments.passes ?? 0) });
     }
     const oldest = pulls[pulls.length - 1]?.updated_at;
-    if (pulls.length < PAGE || (typeof oldest === 'string' && oldest < since)) break;
+    if (pulls.length < PAGE || (typeof oldest === 'string' && oldest < w.start)) break;
   }
   return out.sort((a, b) => a.mergedAt.localeCompare(b.mergedAt));
 }
@@ -240,15 +270,16 @@ export function flakeRecords(dirs: string[]): { flakes: number; rerunUsd: number
 }
 
 /** Gate runs in the window with kind, outcome, cost and flake records; artifacts are read for the newest maxArtifactRuns only. */
-export function readGateRuns(source: ScorecardSource, o: ScorecardOptions, since: string, prCost: Map<number, number>): { gates: GateRun[]; artifactRunsRead: number; artifactErrors: number } {
-  const query = [`status=completed`, `per_page=${PAGE}`, `created=${encodeURIComponent(`>=${since.slice(0, 10)}`)}`,
+export function readGateRuns(source: ScorecardSource, o: ScorecardOptions, w: ScoreWindow, prCost: Map<number, number>): { gates: GateRun[]; artifactRunsRead: number; artifactErrors: number } {
+  const query = [`status=completed`, `per_page=${PAGE}`, createdFilter(w.start, w.end),
     ...(o.gateEvent ? [`event=${encodeURIComponent(o.gateEvent)}`] : [])].join('&');
   const gates: GateRun[] = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
+  for (let page = 1; ; page++) {
+    if (page > MAX_PAGES) throw pageCap('gate runs in the window');
     const body = source.getJson(`repos/${o.repo}/actions/workflows/${o.gateWorkflow}/runs?${query}&page=${page}`) as { workflow_runs?: any[] };
     const runs = Array.isArray(body?.workflow_runs) ? body.workflow_runs : [];
     for (const run of runs) {
-      if (String(run.created_at) < since || (o.gateEvent && run.event !== o.gateEvent)) continue;
+      if (!inWindow(run.created_at, w) || (o.gateEvent && run.event !== o.gateEvent)) continue;
       const title = String(run.display_title ?? run.name ?? '');
       const branch = String(run.head_branch ?? '');
       const pr = Number(/#(\d+)/.exec(title)?.[1] ?? run.pull_requests?.[0]?.number ?? NaN);
@@ -280,14 +311,29 @@ export function readGateRuns(source: ScorecardSource, o: ScorecardOptions, since
   return { gates, artifactRunsRead, artifactErrors };
 }
 
-/** Free-suite runs on base in the window and the flaky-pass entries their flake-ledger-* artifacts hold. */
-export function readFreeRetries(source: ScorecardSource, o: ScorecardOptions, since: string): FreeRetryRun[] {
+/**
+ * Free-suite runs on base in the window and the flaky-pass entries their
+ * flake-ledger-* artifacts hold. A read run that reused its pull request's run
+ * (reuseChecker) is left out and counted in freeRunsSkipped; an unreadable run
+ * and a run past maxArtifactRuns are kept, as before.
+ */
+export function readFreeRetries(source: ScorecardSource, o: ScorecardOptions, w: ScoreWindow): Pick<Scorecard, 'freeRuns' | 'freeRunsSkipped' | 'freeRunsNote'> {
   const client: GhClient = { getJson: p => source.getJson(p), downloadZip: () => { throw new Error('not used'); } };
-  const runs = listWorkflowRuns(client, o.repo, o.freeWorkflow, { since, branch: o.base });
-  const retries = (runId: number): number | null => {
-    try { return [...source.artifactDirs(runId, name => name.startsWith('flake-ledger-')).values()].flatMap(readFlakeLedgerDir).length; } catch { return null; }
-  };
-  return runs.map((run, index) => ({ id: run.id, conclusion: run.conclusion, retries: index < o.maxArtifactRuns ? retries(run.id) : 0 }));
+  const runs = listWorkflowRuns(client, o.repo, o.freeWorkflow, { since: w.start, until: w.end, branch: o.base });
+  const reuse = reuseChecker(client, o.repo);
+  const freeRuns: FreeRetryRun[] = [];
+  let freeRunsSkipped = 0;
+  runs.forEach((run, index) => {
+    if (index >= o.maxArtifactRuns) { freeRuns.push({ id: run.id, conclusion: run.conclusion, retries: 0 }); return; }
+    const names: string[] = [];
+    let retries: number | null;
+    try {
+      retries = [...source.artifactDirs(run.id, name => { names.push(name); return name.startsWith('flake-ledger-'); }).values()].flatMap(readFlakeLedgerDir).length;
+    } catch { retries = null; }
+    if (retries !== null && reuse.reused(run, names)) { freeRunsSkipped++; return; }
+    freeRuns.push({ id: run.id, conclusion: run.conclusion, retries });
+  });
+  return { freeRuns, freeRunsSkipped, freeRunsNote: reuse.note() ?? null };
 }
 
 function searchCount(source: ScorecardSource, q: string): number | null {
@@ -295,30 +341,36 @@ function searchCount(source: ScorecardSource, q: string): number | null {
   return typeof body?.total_count === 'number' ? body.total_count : null;
 }
 
-export function readReleases(source: ScorecardSource, repo: string, since: string): Array<{ tag: string; publishedAt: string }> {
-  const body = source.getJson(`repos/${repo}/releases?per_page=${PAGE}&page=1`);
-  return (Array.isArray(body) ? body : []).filter(r => !r.draft && typeof r.published_at === 'string' && r.published_at >= since)
-    .map(r => ({ tag: String(r.tag_name ?? ''), publishedAt: String(r.published_at) }));
+/** Releases published inside the window, drafts excluded; every page is read, because GitHub orders releases by creation and a draft can be published long after it was created. */
+export function readReleases(source: ScorecardSource, repo: string, w: ScoreWindow): Array<{ tag: string; publishedAt: string }> {
+  const out: Array<{ tag: string; publishedAt: string }> = [];
+  for (let page = 1; ; page++) {
+    if (page > MAX_PAGES) throw pageCap(`releases published since ${w.start}`);
+    const body = source.getJson(`repos/${repo}/releases?per_page=${PAGE}&page=${page}`);
+    const releases = Array.isArray(body) ? body : [];
+    out.push(...releases.filter(r => !r.draft && inWindow(r.published_at, w)).map(r => ({ tag: String(r.tag_name ?? ''), publishedAt: String(r.published_at) })));
+    if (releases.length < PAGE) break;
+  }
+  return out;
 }
 
 /** Every read, each guarded: one unreadable input marks its lines unavailable and the rest still print. */
 export function collectScorecard(source: ScorecardSource, o: ScorecardOptions): Scorecard {
-  const since = new Date(o.now - o.sinceDays * 86_400_000).toISOString();
-  const card: Scorecard = { repo: o.repo, base: o.base, windowStart: since, windowEnd: new Date(o.now).toISOString(),
-    prs: [], gates: [], freeRuns: [], artifactRunsRead: 0, passCap: o.passCap, artifactErrors: 0, issuesOpened: null, issuesClosed: null, releases: [], unavailable: [] };
+  const w = scoreWindow(o);
+  const card: Scorecard = { repo: o.repo, base: o.base, windowStart: w.start, windowEnd: w.end,
+    prs: [], gates: [], freeRuns: [], freeRunsSkipped: 0, freeRunsNote: null, artifactRunsRead: 0, passCap: o.passCap, artifactErrors: 0, issuesOpened: null, issuesClosed: null, releases: [], unavailable: [] };
   const guard = (what: string, fn: () => void) => { try { fn(); } catch (e) { card.unavailable.push(`${what}: ${unavailableReason(e)}`); } };
-  guard('merged PRs', () => { card.prs = readMergedPrs(source, o, since); });
+  guard('merged PRs', () => { card.prs = readMergedPrs(source, o, w); });
   guard('gate runs', () => {
     const prCost = new Map(card.prs.filter(p => p.commentCostUsd !== null).map(p => [p.number, p.commentCostUsd!] as const));
-    Object.assign(card, readGateRuns(source, o, since, prCost));
+    Object.assign(card, readGateRuns(source, o, w, prCost));
   });
-  guard('free retries', () => { card.freeRuns = readFreeRetries(source, o, since); });
-  const instant = since.replace(/\.\d{3}Z$/, 'Z');
+  guard('free retries', () => { Object.assign(card, readFreeRetries(source, o, w)); });
   guard('issues', () => {
-    card.issuesOpened = searchCount(source, `repo:${o.repo} is:issue created:>=${instant}`);
-    card.issuesClosed = searchCount(source, `repo:${o.repo} is:issue closed:>=${instant}`);
+    card.issuesOpened = searchCount(source, `repo:${o.repo} is:issue created:${searchRange(w)}`);
+    card.issuesClosed = searchCount(source, `repo:${o.repo} is:issue closed:${searchRange(w)}`);
   });
-  guard('releases', () => { card.releases = readReleases(source, o.repo, since); });
+  guard('releases', () => { card.releases = readReleases(source, o.repo, w); });
   return card;
 }
 
@@ -347,7 +399,7 @@ export const BENCHMARKS: Record<string, string> = {
   merged: 'several merges a day, every day; outside contributions land in the same week',
   lead_time: 'median under 24h, p90 under 3 days (DORA elite: change lead time under a day)',
   ready_to_merge: 'under 2h from READY to merge; every merged PR carries a READY comment',
-  review_passes: 'median 2 passes, none at the cap (a pass that finds nothing new is the exit; what is left at the cap is named in the PR body)',
+  review_passes: 'median 1 pass, few at the cap (a pass that finds nothing blocking is the exit; a PR at the cap ships with what is left named in the PR body)',
   gates: 'green on 95%+ of runs, cancelled near 0, cost known for every run',
   cost_per_merge: 'known, stable or falling week over week',
   red_train: 'under 5% of trains red (each red train costs a bisect and a rebuild)',
@@ -378,7 +430,7 @@ export function scorecardRows(card: Scorecard): ScorecardRow[] {
     return { id, metric, value: failed ? unavailableText(failed) : value(), benchmark: BENCHMARKS[id]!, rule };
   };
   const paidFlakes = () => `${flakes} paid case(s) passed on their one rerun (rerun spend ${usd(flakeUsd)})${card.artifactErrors ? `; artifacts unreadable on ${card.artifactErrors} run(s)` : ''}`;
-  const freeRetries = () => `${retries} free-suite retr${retries === 1 ? 'y' : 'ies'} in ${retryRuns} of ${card.freeRuns.length} runs${unreadableFree ? ` (${unreadableFree} unreadable)` : ''}`;
+  const freeRetries = () => `${retries} free-suite retr${retries === 1 ? 'y' : 'ies'} in ${retryRuns} of ${card.freeRuns.length} runs${unreadableFree ? ` (${unreadableFree} unreadable)` : ''}${card.freeRunsSkipped ? `; ${card.freeRunsSkipped} reused main push(es) left out` : ''}${card.freeRunsNote ? `; ${card.freeRunsNote}` : ''}`;
   return [
     row('merged', 'Merged PRs', 'merged PRs', () => `${card.prs.length} (crew ${crewPrs.length}, outside ${card.prs.length - crewPrs.length})`,
       `merged_at inside the window, base ${card.base}; crew by login list or author_association OWNER/MEMBER/COLLABORATOR`),
@@ -395,7 +447,7 @@ export function scorecardRows(card: Scorecard): ScorecardRow[] {
     row('red_train', 'Red-train rate', 'gate runs', () => `${pct(trains.filter(t => t.outcome === 'red').length, trains.length)} (${trains.filter(t => t.outcome === 'red').length} red of ${trains.length} trains; ${by('red', 'backstop')} red backstop, ${by('red', 'screen')} red screens)`,
       `runs whose head branch starts with the train prefix, cancelled runs excluded; red means the run's conclusion was not success`),
     row('flaky', 'Flaky events', [], () => `${unavailable('gate runs') ? unavailableText('gate runs') : paidFlakes()}; ${unavailable('free retries') ? unavailableText('free retries') : freeRetries()}`,
-      `flake-records artifacts of the newest ${card.artifactRunsRead} gate runs and flake-ledger artifacts of free runs on the base branch`),
+      `flake-records artifacts of the newest ${card.artifactRunsRead} gate runs and flake-ledger artifacts of free runs on the base branch, reused main pushes left out`),
     row('issues', 'Issues opened / closed', 'issues', () => `${card.issuesOpened ?? 'n/a'} / ${card.issuesClosed ?? 'n/a'}`, 'GitHub search: created, closed inside the window'),
     row('releases', 'Releases cut', 'releases', () => `${card.releases.length}${card.releases.length ? ` (${card.releases.map(r => r.tag).join(', ')})` : ''}`, 'releases published inside the window, drafts excluded'),
   ];

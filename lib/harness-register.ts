@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { bunIsolationArgs } from './bun-isolation';
 import { runBashSync } from './script-invocation';
 import { frontmatterList, routerLine } from './skill-triggers';
+import { activateHook, assertHookRoot, foreignOpenclawConfig, hookChoice, hookConfig, hookFiles, hookProfile, hookRoot, inspectHook, isHookTarget, profileSkills, type HookResult } from './harness-start-hook';
 
 export type SkillsMode = 'router' | 'hybrid' | 'all';
 export type TargetName = 'openclaw' | 'hermes' | 'dots' | 'generic' | 'qm' | 'muse' | 'grok';
@@ -37,6 +38,19 @@ export const DOT_SKILLS_DIR = '/home/dot/skills';
 export const ROUTER_DESCRIPTION = 'Use to review a diff or PR, debug a bug or failing test, QA test a site, plan or review architecture, ship a PR, audit security or write release docs. Load first for any coding task: lists every gstack skill and where to read it.';
 /** OpenClaw hybrid mode: these task skills are listed as skills of their own; the router carries the rest. */
 export const HYBRID_SKILLS = ['review', 'investigate', 'qa', 'ship', 'plan-eng-review'];
+/**
+ * OpenClaw serves a registered skill's SKILL.md whole or refuses it ("Skill instructions cannot be partially
+ * served"), with maxBytes from resolveAdaptiveReadMaxBytes: 32,768 (DEFAULT_READ_PAGE_MAX_BYTES) when the model's
+ * context window is unknown (OpenClaw 2026.10.6 dist/agent-tools.read-BIxUGJy-.mjs:168, :189-194, :747, :798,
+ * :819-821). A known window also applies the tool-result budget to that read (resolveToolResultBudget,
+ * dist/tool-result-limits-DNBSu_jg.mjs:61-95): 16,000 characters under 100K tokens, 32,000 to 200K, 64,000 above.
+ * 32,000 bytes fits the unknown-window limit and a 100K-200K window; windows under 100K tokens are not covered. The
+ * post-delivery cap defaults to a 200K window (64,000 characters). A larger skill is registered as a short
+ * entry that points at its full SKILL.md in a plain tree of every skill, which OpenClaw reads in pages.
+ */
+export const OPENCLAW_INSTRUCTION_MAX = 32_000;
+/** The plain tree under --skills all: a dot folder, which OpenClaw's skill scan skips (dist/skill-root-discovery-C2QVZC77.mjs:44). Hybrid and router use the router's own gstack/skills, which the scan never enters because gstack/ holds a SKILL.md (:343). */
+export const OPENCLAW_ALL_TEXTS = '.gstack-skills';
 
 export interface Target {
   name: TargetName;
@@ -46,6 +60,8 @@ export interface Target {
   render: 'host' | 'claude' | null;
   defaultMode: SkillsMode;
   modes: SkillsMode[];
+  /** Largest SKILL.md the harness serves whole; a larger skill is registered as an entry pointing at its full text. */
+  instructionMax?: number;
   /** Destination folder for this target, from its environment, or null when it has no default. */
   dest: (env: Env, home: string) => string | null;
   /** Running inside this harness: a session marker or the harness among this process's ancestors. */
@@ -65,7 +81,7 @@ const ancestorIs = (ancestry: string[], name: string) => ancestry.some(id => {
 
 export const TARGETS: Record<TargetName, Target> = {
   openclaw: {
-    name: 'openclaw', displayName: 'OpenClaw', mechanism: 'skill-folder', render: 'host', defaultMode: 'hybrid', modes: ['router', 'hybrid', 'all'],
+    name: 'openclaw', displayName: 'OpenClaw', mechanism: 'skill-folder', render: 'host', defaultMode: 'hybrid', modes: ['router', 'hybrid', 'all'], instructionMax: OPENCLAW_INSTRUCTION_MAX,
     dest: (env, home) => path.join(env.OPENCLAW_STATE_DIR || path.join(home, '.openclaw'), 'skills'),
     inside: (env, anc) => env.OPENCLAW_SHELL === 'exec' || ancestorIs(anc, 'openclaw'),
     present: (env, home) => onPath('openclaw', env) || fs.existsSync(env.OPENCLAW_STATE_DIR || path.join(home, '.openclaw')),
@@ -119,6 +135,10 @@ export const HARNESS_CODES = {
   HARNESS_RENDER_FAILED: { anchor: 'harness-render-failed', fix: 'run bun install in the gstack checkout, then register again; the render output above names the failing skill' },
   HARNESS_BUDGET_EXCEEDED: { anchor: 'harness-budget-exceeded', fix: 'this is a gstack bug: report it with the byte count printed above' },
   HARNESS_NOT_REGISTERED: { anchor: 'harness-not-registered', fix: 'run gstack-harness status to see the registrations on this machine' },
+  HARNESS_HOOK_UNSUPPORTED: { anchor: 'harness-hook-unsupported', fix: 'the start hook is for OpenClaw and Hermes registered in their own profile: drop --skills-dir (set OPENCLAW_STATE_DIR or HERMES_HOME to pick the profile), unset OPENCLAW_CONFIG_PATH or point it at the profile\'s own openclaw.json, or drop --start-hook' },
+  HARNESS_HOOK_CHOICE_INVALID: { anchor: 'harness-hook-choice-invalid', fix: 'set it to on or off (GSTACK_HARNESS_START_HOOK also takes 1 or 0), or unset it' },
+  HARNESS_HOOK_OWNED_ELSEWHERE: { anchor: 'harness-hook-owned-elsewhere', fix: 'if another gstack install wrote it, run that install\'s gstack-harness register <harness> --no-start-hook; otherwise move the folder aside, then register again' },
+  HARNESS_HOOK_INACTIVE: { anchor: 'harness-hook-inactive', fix: 'run the command printed above, then gstack-harness status; the skills themselves are registered' },
   HARNESS_QM_CREDENTIALS: { anchor: 'harness-qm-credentials', fix: 'set GSTACK_QM_URL and either GSTACK_QM_ADMIN_TOKEN, or GSTACK_QM_SIGNING_SECRET with GSTACK_QM_ADMIN_ACTOR, then rerun with --yes' },
   HARNESS_QM_API: { anchor: 'harness-qm-api', fix: 'check that the QM core URL is reachable and the credential is an org admin; gstack-harness status shows whether a pack was left half-registered' },
   HARNESS_QM_PACK_TOO_LARGE: { anchor: 'harness-qm-pack-too-large', fix: 'QM registration is not available yet; give a QM agent gstack with gstack-harness register generic --print pasted into its instructions' },
@@ -239,6 +259,19 @@ export function routerSkill(skills: Array<{ name: string; use: string; path: str
   ].join('\n');
 }
 
+/** A registered skill whose full text is over the harness's whole-document read limit: its own frontmatter, and a body that sends the agent to the full text. */
+export function entrySkill(md: string, fullPath: string, target: Target): string {
+  const end = md.indexOf('\n---', 4);
+  return [
+    md.slice(0, md.indexOf('\n', end + 4) + 1) + '<!-- AUTO-GENERATED by gstack-harness register: rerun it instead of editing -->',
+    '# ' + frontmatterField(md, 'name'), '',
+    'This skill\'s full instructions (' + Buffer.byteLength(md) + ' bytes) are larger than ' + target.displayName + ' serves as a skill file, so they are in a plain file.'
+      + ' Read `' + fullPath + '` in full now (every page, if the read is split) and follow it as this skill\'s instructions.'
+      + ' Paths it gives relative to the installed SKILL.md directory resolve from that file\'s folder.',
+    '',
+  ].join('\n');
+}
+
 /** The marked context block for the registration's mode: router (a router path), hybrid (a router path and direct skills) or all (no router). */
 export function contextBlock(routerPath: string | null, direct: string[] = []): string {
   const lead = "gstack's engineering workflows (code review, QA, debugging, security audit, plan review, shipping) are installed here. ";
@@ -314,10 +347,14 @@ export interface RegisterOptions {
   version: string;
   /** Publish an installs.tsv row for host targets (setup's own arm publishes it instead). */
   registry?: boolean;
+  /** --start-hook (true) or --no-start-hook (false); otherwise GSTACK_HARNESS_START_HOOK, gstack-config harness_start_hook, then the ledger decide (lib/harness-start-hook.ts). */
+  startHook?: boolean;
 }
 export interface RegisterResult {
   id: string; target: TargetName; dest: string; mode: SkillsMode;
   status: 'installed' | 'updated' | 'unchanged'; written: number; skills: number; router: string | null; ledger: string; kept: string[];
+  /** The start hook, for OpenClaw and Hermes; required: this run turned it on or was asked to, so anything but active is a failure. */
+  hook?: HookResult & { required?: boolean; retried?: boolean };
 }
 
 const PLAIN = /^[^\t\n\r]+$/;
@@ -361,21 +398,26 @@ export function planPayload(opts: RegisterOptions, dest: string, mode: SkillsMod
     files.set(path.join(to, 'SKILL.md'), Buffer.from(flatFrontmatter(fs.readFileSync(path.join(s.dir, 'SKILL.md'), 'utf8'), path.basename(to))));
     if (fs.existsSync(path.join(s.dir, 'sections'))) copyDir(path.join(s.dir, 'sections'), path.join(to, 'sections'));
   };
+  const routerDir = path.join(dest, 'gstack');
+  const plain = path.join(...(mode === 'all' ? [dest, OPENCLAW_ALL_TEXTS] : [routerDir, 'skills']));
   const listed = (s: SkillEntry) => {
     const to = path.join(dest, path.basename(s.dir));
-    if (t.render === 'host') copyDir(s.dir, to); else claudeFiles(s, to);
+    const md = fs.readFileSync(path.join(s.dir, 'SKILL.md'));
+    if (t.instructionMax && md.length > t.instructionMax) files.set(path.join(to, 'SKILL.md'), Buffer.from(entrySkill(md.toString('utf8'), path.join(plain, path.basename(s.dir), 'SKILL.md'), t)));
+    else if (t.render === 'host') copyDir(s.dir, to); else claudeFiles(s, to);
     return t.render === 'host' ? s.name : path.basename(s.dir);
   };
   if (mode === 'all') {
     const names = skills.map(listed);
+    if (t.instructionMax) for (const s of skills) copyDir(s.dir, path.join(plain, path.basename(s.dir)));
     return { files, router: null, visible: names, direct: [], skills: names.length };
   }
   const isDirect = (s: SkillEntry) => mode === 'hybrid' && HYBRID_SKILLS.includes(path.basename(s.dir).replace(/^gstack-/, ''));
   const direct = skills.filter(isDirect).map(listed);
-  const routerDir = path.join(dest, 'gstack');
+  if (t.instructionMax) for (const s of skills.filter(isDirect)) copyDir(s.dir, path.join(plain, path.basename(s.dir)));
   const entries = skills.filter(s => !isDirect(s)).map(s => {
     if (t.render !== 'host') return { name: s.name, use: s.use, path: path.join(s.dir, 'SKILL.md') };
-    const to = path.join(routerDir, 'skills', path.basename(s.dir));
+    const to = path.join(plain, path.basename(s.dir));
     copyDir(s.dir, to);
     return { name: s.name, use: s.use, path: path.join(to, 'SKILL.md') };
   });
@@ -391,9 +433,10 @@ function keepEdit(file: string, stamp: string): string {
   return to;
 }
 
-/** Refuses a path outside dest, or one reached through a symlink below dest. */
-function assertOwnedPath(dest: string, p: string): void {
-  if (!p.startsWith(dest + path.sep)) throw new HarnessError('HARNESS_UNSAFE_DESTINATION', p + ' is outside ' + dest);
+/** Refuses a path outside every owned root (the destination, and the start hook's folder), or one reached through a symlink below its root. */
+function assertOwnedPath(roots: string[], p: string): void {
+  const dest = roots.find(r => r && p.startsWith(r + path.sep));
+  if (!dest) throw new HarnessError('HARNESS_UNSAFE_DESTINATION', p + ' is outside ' + roots.filter(Boolean).join(' and '));
   for (let d = p; d !== dest; d = path.dirname(d)) {
     let st: fs.Stats;
     try { st = fs.lstatSync(d); } catch { continue; }
@@ -482,6 +525,58 @@ function shellRegistry(opts: RegisterOptions, fn: string, args: string[]): boole
   return sourcedBash(opts.checkout, 'gstack-install-registry.sh', fn, args, opts.stateRoot, opts.env).status === 0;
 }
 
+interface HookPlan { on: boolean; prevOn: boolean; explicit: boolean; retry: boolean; profile: string; root: string; files: Map<string, Buffer>; note?: string; fix?: string; requested?: boolean }
+
+/** The start hook for this run: whether it is on, where it goes, and its files (null for targets without a hook). */
+function hookPlan(opts: RegisterOptions, dest: string, prev: Ledger | null): HookPlan | null {
+  const t = opts.target;
+  if (!isHookTarget(t.name)) {
+    if (opts.startHook) throw new HarnessError('HARNESS_HOOK_UNSUPPORTED', t.displayName + ' has no start hook');
+    return null;
+  }
+  const choice = hookChoice(opts.startHook, opts.env, opts.stateRoot, prev?.meta.start_hook);
+  if ('invalid' in choice) throw new HarnessError('HARNESS_HOOK_CHOICE_INVALID', choice.invalid + ' is not on or off');
+  const prevOn = prev?.meta.start_hook === 'on' && !!prev.meta.hook_root && !!prev.meta.hook_profile;
+  const profile = prevOn ? prev!.meta.hook_profile : hookProfile(t.name, opts.env, opts.home);
+  const root = hookRoot(t.name, profile);
+  const plan = { on: choice.on, prevOn, explicit: choice.source === 'flag', retry: prevOn && prev!.meta.hook_active === 'no', profile, root, files: new Map<string, Buffer>() };
+  const saved = prev?.meta.hook_root && prev.meta.hook_profile ? { profile: prev.meta.hook_profile, root: prev.meta.hook_root } : null;
+  const name = t.name;
+  const off = (p: HookPlan) => { if (saved) assertHookRoot(name, saved.profile, saved.root, saved.root, (code, msg) => { throw new HarnessError(code, msg); }); return p; };
+  if (!choice.on) return off(plan);
+  const requested = !opts.inherit;
+  const foreign = t.name === 'openclaw' ? foreignOpenclawConfig(opts.env, profile) : '';
+  const [why, fix] = dest !== profileSkills(t.name, profile) ? ['this registration uses another skills folder (' + dest + ')', 'register without --skills-dir to get the hook, or pass --no-start-hook to keep this registration without it']
+    : foreign ? ['OPENCLAW_CONFIG_PATH points OpenClaw at ' + foreign + ', outside that profile', 'unset OPENCLAW_CONFIG_PATH or set it to ' + hookConfig('openclaw', profile) + ', then register again'] : ['', ''];
+  if (why && (plan.explicit || !prevOn)) {
+    if (plan.explicit) throw new HarnessError('HARNESS_HOOK_UNSUPPORTED', 'the start hook goes into the ' + t.displayName + ' profile ' + profile + ', and ' + why);
+    return off({ ...plan, on: false, requested, fix, note: 'off: ' + why + ' (' + choice.source + ' asked for the hook)' });
+  }
+  try {
+    assertHookRoot(t.name, profile, root, prevOn ? prev!.meta.hook_root : undefined, (code, msg) => { throw new HarnessError(code, msg); });
+  } catch (e) {
+    if (plan.explicit || prevOn || !(e instanceof HarnessError)) throw e;
+    return off({ ...plan, on: false, requested, fix: HARNESS_CODES[e.code].fix, note: 'off: ' + e.message + ' (' + choice.source + ' asked for the hook)' });
+  }
+  return { ...plan, files: hookFiles(t.name, root) };
+}
+
+/** Turns the hook on after its files are written (when this run turns it on, was asked to, or the last try did not end active), and reads it back. */
+function finishHook(opts: RegisterOptions, hook: HookPlan | null, released: string): RegisterResult['hook'] {
+  if (!hook) return undefined;
+  if (!hook.on) return { state: 'off', ...(hook.note ? { detail: hook.note } : {}), ...(released || hook.fix ? { fix: released || hook.fix } : {}), ...(hook.requested ? { required: true } : {}) };
+  const t = opts.target.name as 'openclaw' | 'hermes';
+  const required = !hook.prevOn || hook.explicit;
+  if (!required && !hook.retry) return { state: 'unchecked', profile: hook.profile, root: hook.root, fix: 'gstack-harness status shows whether it is active' };
+  if (!required) {
+    const now = inspectHook(t, hook.profile, opts.env, opts.home);
+    if (now.state === 'active' || now.state === 'disabled') return { ...now, profile: hook.profile, root: hook.root, retried: true };
+  }
+  const failed = activateHook(t, hook.profile, opts.env, opts.home);
+  const r = inspectHook(t, hook.profile, opts.env, opts.home);
+  return { ...r, ...(failed && r.state !== 'active' && !r.detail?.startsWith(failed) ? { detail: failed + (r.detail ? '; ' + r.detail : '') } : {}), profile: hook.profile, root: hook.root, required, retried: !required };
+}
+
 export function register(opts: RegisterOptions): RegisterResult {
   const t = opts.target;
   if (t.mechanism === 'verify-only' || t.mechanism === 'skill-pack-api') throw new HarnessError('HARNESS_UNKNOWN_TARGET', t.name + ' is not registered through files (use status for ' + t.name + ', or lib/harness-qm.ts for qm)');
@@ -497,12 +592,13 @@ export function register(opts: RegisterOptions): RegisterResult {
   if (explicit) { assertSafeDest(explicit, opts); assertContextFile(t, explicit); }
   const lfile = ledgerPath(opts.stateRoot, id);
   const prev = readLedger(lfile);
+  const hook = hookPlan(opts, dest, prev);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-harness-'));
   try {
     const { files, router, visible, direct, skills } = planPayload(opts, dest, mode, scratch);
     const prevFiles = new Map((prev?.files ?? []).map(f => [f.path, f.sha]));
     const topOf = (p: string) => path.join(dest, path.relative(dest, p).split(path.sep)[0]);
-    const owned = new Set([...prevFiles.keys()].map(topOf));
+    const owned = new Set([...prevFiles.keys()].filter(p => p.startsWith(dest + path.sep)).map(topOf));
     for (const top of new Set([...files.keys()].map(topOf))) {
       let st: fs.Stats;
       try { st = fs.lstatSync(top); } catch { continue; }
@@ -516,7 +612,8 @@ export function register(opts: RegisterOptions): RegisterResult {
       const other = frontmatterField(fs.readFileSync(md, 'utf8'), 'name');
       if (visible.includes(other)) throw new HarnessError('HARNESS_UNOWNED_ENTRY', 'a skill named ' + other + ' already exists at ' + path.join(dest, e) + ' and gstack did not write it');
     }
-    for (const p of new Set([...files.keys(), ...prevFiles.keys()])) assertOwnedPath(dest, p);
+    for (const [p, b] of hook?.files ?? []) files.set(p, b);
+    for (const p of new Set([...files.keys(), ...prevFiles.keys()])) assertOwnedPath([dest, prev?.meta.hook_root ?? '', hook?.on ? hook.root : ''], p);
     const want = [...files].map(([p, b]) => ({ path: p, sha: sha256(b) }));
     const context = opts.context ? path.resolve(opts.context) : prev?.meta.context ?? '';
     const block = contextBlock(router, direct);
@@ -540,18 +637,21 @@ export function register(opts: RegisterOptions): RegisterResult {
     const same = prev && prev.meta.mode === mode && prev.meta.names === visible.join(',') && prev.files.length === want.length
       && (prev.meta.context ?? '') === context && prev.blocks.length === blocks.length
       && blocks.every(b => prev.blocks.some(p => p.path === b.path && p.sha === b.sha && p.pad === b.pad))
-      && want.every(w => prevFiles.get(w.path) === w.sha && onDiskSha(w.path) === w.sha);
+      && want.every(w => prevFiles.get(w.path) === w.sha && onDiskSha(w.path) === w.sha)
+      && (!hook || (prev.meta.start_hook ?? 'off') === (hook.on ? 'on' : 'off'));
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const kept: string[] = [];
     let written = 0;
+    const released = hook?.prevOn && !hook.on ? sourcedBash(opts.checkout, 'gstack-harness-ledger.sh', 'gstack_harness_hook_release', [lfile], opts.stateRoot, opts.env).stdout.trim() : '';
     if (!same) {
       const dirs = new Set(prev?.dirs ?? []);
       for (const p of files.keys()) for (let d = path.dirname(p); !fs.existsSync(d) && path.dirname(d) !== d; d = path.dirname(d)) dirs.add(d);
-      const record = (recorded: typeof want) => writeLedger(lfile, {
-        meta: { id, target: t.name, dest, mode, checkout: opts.checkout, version: opts.version, names: visible.join(','), ...(router ? { router } : {}), ...(context ? { context } : {}) },
+      const record = (recorded: typeof want, final: boolean) => writeLedger(lfile, {
+        meta: { id, target: t.name, dest, mode, checkout: opts.checkout, version: opts.version, names: visible.join(','), ...(router ? { router } : {}), ...(context ? { context } : {}),
+          ...(hook ? { start_hook: hook.on ? 'on' : 'off' } : {}), ...(hook?.on ? { hook_profile: hook.profile, hook_root: hook.root, ...(!hook.prevOn || hook.explicit ? { hook_active: 'no' } : prev?.meta.hook_active ? { hook_active: prev.meta.hook_active } : {}) } : !final && prev?.meta.hook_root ? { hook_profile: prev.meta.hook_profile, hook_root: prev.meta.hook_root } : {}) },
         files: recorded, dirs: [...dirs].sort((a, b) => b.length - a.length), blocks,
       });
-      record([...want, ...(prev?.files ?? []).filter(f => !files.has(f.path))]);
+      record([...want, ...(prev?.files ?? []).filter(f => !files.has(f.path))], false);
       for (const [p, sha] of prevFiles) {
         if (files.has(p)) continue;
         const disk = onDiskSha(p);
@@ -570,7 +670,7 @@ export function register(opts: RegisterOptions): RegisterResult {
         fs.renameSync(p + '.gstack-new', p);
         written++;
       }
-      record(want);
+      record(want, true);
     }
     for (const [file, text] of blockWrites) {
       if (text === (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null)) continue;
@@ -578,7 +678,12 @@ export function register(opts: RegisterOptions): RegisterResult {
       fs.writeFileSync(file, text);
     }
     if (opts.registry && t.render === 'host') shellRegistry(opts, 'gstack_install_registry_upsert', [t.name, 'global', '-', dest, opts.checkout, opts.checkout, opts.version, '-', '-']);
-    return { id, target: t.name, dest, mode, status: !prev ? 'installed' : same ? 'unchanged' : 'updated', written, skills, router, ledger: lfile, kept };
+    if (same && hook?.on && hook.explicit && prev.meta.hook_active !== 'no') writeLedger(lfile, { ...prev, meta: { ...prev.meta, hook_active: 'no' } });
+    const hookResult = finishHook(opts, hook, released);
+    const active = hook?.on && (hookResult?.required || hookResult?.retried) ? ({ active: 'yes', disabled: 'disabled' } as Record<string, string>)[hookResult!.state] ?? 'no' : '';
+    const saved = active ? readLedger(lfile) : null;
+    if (saved && saved.meta.hook_active !== active) writeLedger(lfile, { ...saved, meta: { ...saved.meta, hook_active: active } });
+    return { id, target: t.name, dest, mode, status: !prev ? 'installed' : same ? 'unchanged' : 'updated', written, skills, router, ledger: lfile, kept, ...(hookResult ? { hook: hookResult } : {}) };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
@@ -614,7 +719,7 @@ export function refresh(base: Omit<RegisterOptions, 'target'>, skip: Set<string>
     }));
 }
 
-export interface StatusRow { id: string; target: string; dest: string; mode: string; files: number; version: string; stale: boolean; visible: 'yes' | 'no' | 'unknown'; checked?: string; missing?: string[] }
+export interface StatusRow { id: string; target: string; dest: string; mode: string; files: number; version: string; stale: boolean; visible: 'yes' | 'no' | 'unknown'; checked?: string; missing?: string[]; hook?: HookResult }
 
 /** Runs the harness's own skill list: 'yes' when every name shows (or, with any, at least one). */
 export function harnessSees(t: Target, dest: string, env: Env, names: string[], any = false): { visible: 'yes' | 'no' | 'unknown'; checked?: string; missing?: string[] } {
@@ -631,6 +736,8 @@ export function status(stateRoot: string, version: string, env: Env, check = tru
   return listLedgers(stateRoot).map(({ ledger: l }) => {
     const t = (TARGETS as Record<string, Target>)[l.meta.target];
     const seen = check && t ? harnessSees(t, l.meta.dest, env, (l.meta.names ?? '').split(',').filter(Boolean)) : { visible: 'unknown' as const };
-    return { id: l.meta.id, target: l.meta.target, dest: l.meta.dest, mode: l.meta.mode, files: l.files.length, version: l.meta.version, stale: l.meta.version !== version, ...seen };
+    const on = l.meta.start_hook === 'on' && isHookTarget(l.meta.target) && !!l.meta.hook_profile;
+    const hook = on ? (check ? inspectHook(l.meta.target as 'openclaw' | 'hermes', l.meta.hook_profile, env, os.homedir()) : { state: 'unchecked' as const }) : undefined;
+    return { id: l.meta.id, target: l.meta.target, dest: l.meta.dest, mode: l.meta.mode, files: l.files.length, version: l.meta.version, stale: l.meta.version !== version, ...seen, ...(hook ? { hook } : {}) };
   });
 }

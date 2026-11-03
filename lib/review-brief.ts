@@ -1,0 +1,225 @@
+/**
+ * review-brief — every /ship reviewer brief rendered from its section's own bytes (GSTA-167
+ * no-loss gate). The text comes from ship/sections/review-army.md and ship/sections/adversarial.md
+ * at render time, cut out between fixed anchors; only the declared slots below are filled. The
+ * dispatch program passes the rendered file verbatim as the reader's prompt, and
+ * lib/review-ledger.ts proves it did by hash. Nothing here is composed by the model.
+ *
+ * Slots by role:
+ *   specialist          name, checklist, diff_base, exclude, stack, test_fw, learnings (security adds the defensive framing)
+ *   specialist-batched  checklists (comma list), diff_base, exclude, stack, test_fw, learnings
+ *   red-team            checklist, diff_base, findings (the merged specialist lines), specialists (their count)
+ *   adversarial-native  diff_base
+ *   outside-voice       diff_base, diff (the branch diff, which the bin reads from git)
+ *   fix-check           fix_list, hunks, tests, callers (scripts/resolvers/fix-check.ts)
+ *   targeted            classes, brief (review/specialists/targeted.md's text), checklist (its path), diff_base, stack, test_fw, learnings
+ *
+ * With the base policy's review_exclude_paths active (lib/review-exclude.ts) every role but fix-check also takes
+ * policy_exclude (the `:(top,exclude,glob)` items, which the fixture-handling command of the security specialist, the
+ * Red Team and the native adversarial pass gets), keep (the kept files' `:(top,literal)` items) and disclosure (the one
+ * line naming what was left out). Unset, every brief renders byte for byte as before.
+ */
+import { spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { renderFixCheckPrompt } from '../scripts/resolvers/fix-check';
+import { parseClassList, targetedBrief } from './review-targeted';
+
+export const BRIEF_ROLES = ['specialist', 'specialist-batched', 'red-team', 'adversarial-native', 'outside-voice', 'fix-check', 'targeted'] as const;
+export type BriefRole = typeof BRIEF_ROLES[number];
+export type Slots = Record<string, string | undefined>;
+
+/** The hash every brief and every dispatched prompt is compared by: sha256 of the text without trailing whitespace. */
+export function promptHash(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n/g, '\n').replace(/\s+$/, '')).digest('hex');
+}
+
+export class BriefError extends Error {}
+
+/** The text strictly between start and end, end searched after start; both anchors are required. */
+function between(text: string, start: string, end: string, what: string): string {
+  const i = text.indexOf(start);
+  if (i < 0) throw new BriefError(`${what}: start anchor not found in the section (${JSON.stringify(start.slice(0, 40))})`);
+  const j = text.indexOf(end, i + start.length);
+  if (j < 0) throw new BriefError(`${what}: end anchor not found in the section (${JSON.stringify(end.slice(0, 40))})`);
+  return text.slice(i + start.length, j);
+}
+/** A quoted prompt body as the reader receives it: the section escapes its inner quotes and line breaks. */
+const unquote = (s: string) => s.replace(/\\"/g, '"').replace(/\\n/g, '\n');
+
+export interface SectionTexts { specialist: string; framing: string; fixtures: string; redTeam: string; native: string; outside: string }
+
+/** Cut every brief body out of the installed sections under root (the directory holding ship/). */
+export function sectionTexts(root: string): SectionTexts {
+  const read = (rel: string) => {
+    try { return fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n/g, '\n'); } catch { throw new BriefError(`cannot read ${rel} under ${root}`); }
+  };
+  const army = read('ship/sections/review-army.md');
+  const adv = read('ship/sections/adversarial.md');
+  const specialist = unquote(between(army, '\n"You are a specialist code reviewer.', 'Past learnings: {learnings or \'none\'}"', 'specialist brief'));
+  return {
+    specialist: `You are a specialist code reviewer.${specialist}Past learnings: {learnings or 'none'}`
+      .replace(/ \(`<diff-base>`: write the sha in before dispatch[\s\S]*?on `DIFF_EXCLUDE: none`\)/, ''),
+    framing: unquote(between(army, 'Begin the prompt with:\n"', '"\nand replace its full-diff command', 'defensive framing')),
+    fixtures: unquote(between(army, 'and replace its full-diff command with: "', '"\nEvery other specialist', 'fixture handling')),
+    redTeam: unquote(between(army, 'fixture handling from item 4 of the specialist dispatch: "', 'don\'t cover."', 'red-team brief')) + 'don\'t cover.',
+    native: unquote(between(adv, 'Subagent prompt:\n"', '"\n\nPresent findings', 'adversarial-native brief')),
+    outside: unquote(between(adv, 'Outside prompt (supply repository context from the parent):\n\n"', '"\n\nWrite the **complete prompt and context**', 'outside-voice brief')),
+  };
+}
+
+const SHA = /^[0-9a-f]{7,40}$/;
+const FENCE = '`'.repeat(3);
+function need(slots: Slots, key: string): string {
+  const v = slots[key];
+  if (v === undefined || v === '') throw new BriefError(`missing slot ${key}`);
+  return v;
+}
+function fill(text: string, pairs: Array<[string, string]>, what: string): string {
+  let out = text;
+  for (const [from, to] of pairs) {
+    if (!out.includes(from)) throw new BriefError(`${what}: placeholder ${from} is not in the section text (the section changed; update lib/review-brief.ts)`);
+    out = out.split(from).join(to);
+  }
+  return out;
+}
+const SPECIALIST_DIFF = 'run\n`DIFF_BASE=<diff-base> && git diff "$DIFF_BASE" <exclude>` to get the diff';
+
+const PLACEHOLDERS = ['<diff-base>', '<exclude>', '<list-exclude>', '<base>', '{checklist path}', '{STACK}', '{TEST_FW}', '{merged findings summary}', '{red-team checklist path}', '{learnings'];
+
+/**
+ * Render one reader's brief. Throws BriefError on a missing slot, a section that no longer carries an anchor or placeholder, or a placeholder left unfilled.
+ * Findings and learnings are reviewer text that may quote a slot name such as origin/<base> (GST-797): they render as a token, so the
+ * placeholder check and the slot fills never see them, and go in last, trimmed as renderRole trims them. The token carries a
+ * per-render nonce, so no other slot's text (a diff, a hunk) can name it.
+ */
+export function renderBrief(role: BriefRole, slots: Slots, t: SectionTexts): string {
+  const nonce = randomUUID();
+  const keys = ['findings', 'learnings'].filter(k => slots[k]?.trim());
+  const held: Slots = { ...slots };
+  for (const k of keys) held[k] = `\u0000${nonce}:${k}\u0000`;
+  const rendered = renderRole(role, held, t);
+  const keep = slots.keep ? ` Read the files kept despite a match as well: \`git diff ${slots.diff_base} -- ${slots.keep}\`.` : '';
+  const text = slots.disclosure && role !== 'fix-check' && role !== 'outside-voice' ? `${rendered}\n\n${slots.disclosure}${keep}` : rendered;
+  const left = role === 'fix-check' || role === 'outside-voice' ? [] : PLACEHOLDERS.filter(p => text.includes(p));
+  if (left.length) throw new BriefError(`${role}: unfilled placeholder ${left.join(', ')}`);
+  return keys.reduce((out, k) => out.split(held[k]!).join(slots[k]!.trim()), text);
+}
+
+function renderRole(role: BriefRole, slots: Slots, t: SectionTexts): string {
+  const diffBase = role === 'fix-check' ? '' : need(slots, 'diff_base');
+  if (diffBase && !SHA.test(diffBase)) throw new BriefError(`slot diff_base must be a literal commit sha, got ${JSON.stringify(diffBase)}`);
+  const fixtures = (text: string) => text.split(' <exclude>`').join(slots.policy_exclude ? ` ${slots.policy_exclude}\`` : '`')
+    .split('<list-exclude>`').join(slots.policy_exclude ? ` -- . ${slots.policy_exclude}\`` : '`');
+  const common = (body: string, checklist: string) => fill(body, [
+    ...(checklist ? [['{checklist path}', checklist] as [string, string]] : []), ['<diff-base>', diffBase],
+    ['{TEST_FW}', slots.test_fw || 'unknown'], ['{STACK}', slots.stack || 'unknown'], ['{learnings or \'none\'}', slots.learnings?.trim() || 'none'],
+  ], role).split(' <exclude>`').join(slots.exclude ? ' ' + slots.exclude + '`' : '`');
+  switch (role) {
+    case 'specialist': {
+      const name = need(slots, 'name');
+      const checklist = need(slots, 'checklist');
+      if (name !== 'security') return common(t.specialist, checklist);
+      const body = fill(t.specialist, [[SPECIALIST_DIFF, 'set `DIFF_BASE=<diff-base>` first. ' + fixtures(t.fixtures) + ' Then read the diff that way']], role);
+      return `${t.framing}\n\n${common(body, checklist)}`;
+    }
+    case 'specialist-batched': {
+      const lists = need(slots, 'checklists').split(',').map(s => s.trim()).filter(Boolean);
+      const body = fill(t.specialist, [['Read the checklist at {checklist path}', `Read each checklist at ${lists.join(', ')} (tag each finding's "specialist" with the name of the checklist it came from)`]], role);
+      return common(body, '');
+    }
+    case 'red-team': {
+      const body = fill(t.redTeam, [['{merged findings summary}', (slots.findings ?? '').trim() || '(none)'], ['by N specialists', `by ${need(slots, 'specialists')} specialists`],
+        ['{red-team checklist path}', need(slots, 'checklist')], ['<diff-base>', diffBase]], role);
+      return fixtures(`${t.framing}\n\n${t.fixtures}\n\n${body}`);
+    }
+    case 'adversarial-native':
+      return fixtures(fill(t.native, [['DIFF_BASE=$(git merge-base origin/<base> HEAD)', `DIFF_BASE=${diffBase}`]], role));
+    case 'outside-voice': {
+      const filled = fill(t.outside, [['DIFF_BASE=$(git merge-base origin/<base> HEAD)', `DIFF_BASE=${diffBase}`]], role);
+      const body = slots.policy_exclude ? filled.split('git diff "$DIFF_BASE".').join(`git diff "$DIFF_BASE" -- . ${slots.policy_exclude}${slots.keep ? ` and git diff "$DIFF_BASE" -- ${slots.keep}` : ''}.`) : filled;
+      return [body, '', ...(slots.disclosure ? [slots.disclosure, ''] : []), `## Branch diff (git diff ${diffBase})`, FENCE + 'diff', (slots.diff ?? '').trim(), FENCE].join('\n');
+    }
+    case 'targeted': {
+      const classes = parseClassList(need(slots, 'classes'));
+      if (!classes?.length) throw new BriefError(`slot classes must list money, gate, auth or secret, got ${JSON.stringify(slots.classes)}`);
+      let brief: string;
+      try { brief = targetedBrief(need(slots, 'brief'), classes); } catch (e) { throw new BriefError((e as Error).message); }
+      const body = fill(t.specialist, [['Read the checklist at {checklist path}', `Read the targeted brief above (${need(slots, 'checklist')}: ${classes.join(', ')})`]], role);
+      return `${brief}\n\n${common(body, '')}`;
+    }
+    case 'fix-check':
+      return renderFixCheckPrompt({ fixList: need(slots, 'fix_list'), touchedHunks: need(slots, 'hunks'), testResults: need(slots, 'tests'), callers: slots.callers ?? '' });
+  }
+}
+
+const quoted = (dir: string) => `'${dir.replace(/'/g, `'\\''`)}'`;
+const treeCommand = (dir: string) => `cd ${quoted(dir)} && echo "REVIEWED_TREE: $(git rev-parse 'HEAD^{tree}') $(git rev-parse --show-toplevel)"`;
+
+/**
+ * The opening step every dispatched brief carries (GST-897): the fingerprint command and what to copy from it. A reader that
+ * follows a findings-only output format can skip a request that only closes a long brief (gpt-6.1-sol did on GST-850), and
+ * "the line <command> prints" was read as the command itself, so the step comes first and names the output line.
+ */
+export function workspaceStep(dir: string): string {
+  return `First step, before anything else: run \`${treeCommand(dir)}\`. It outputs one line, \`REVIEWED_TREE: <tree hash> <path>\`. Copy that output line, not the command, as the first line of your final reply, above everything else, even where this brief limits your output to findings or says how to end it; a reply without it, or from another checkout, does not count.`;
+}
+
+/**
+ * The closing paragraph every dispatched brief carries (GST-482): a reader on a shared machine starts in that machine's working
+ * directory, and every command runs in a fresh shell, so the brief names the checkout under review and asks again for the
+ * fingerprint workspaceStep opens with. The section's render sits between the two, byte for byte what renderBrief returns.
+ */
+export function workspaceParagraph(dir: string): string {
+  return `Workspace: the checkout under review is ${dir}. Your shell and file tools may start in another checkout, and every command runs in a fresh shell: begin each command with \`cd ${quoted(dir)} && \`, and give every file read, search, edit or write an absolute path under ${dir}. The first line of your final reply is the \`REVIEWED_TREE: <tree hash> <path>\` line that \`${treeCommand(dir)}\` outputs (the output, not the command), even where this brief limits your output to findings; a reply without it, or from another checkout, does not count.`;
+}
+export const withWorkspace = (text: string, dir: string) => `${workspaceStep(dir)}\n\n${text}\n\n${workspaceParagraph(dir)}`;
+/** The checkout a brief names: the toplevel of the directory the bins run in, where its diff and merge base come from. */
+export function checkoutRoot(): string {
+  const r = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 30_000 });
+  return realDir(r.status === 0 ? r.stdout.trim() : process.cwd());
+}
+
+/**
+ * One REVIEWED_TREE line as "<tree> <toplevel>", or null. A list marker, heading mark or `printed:` label (GST-776, also after the echoed `cd … && echo …` command on the same line) may lead it, and a whole-line `**…**` or
+ * backtick wrapper, a bold label and backticks around the sha or the whole path are removed; the path's own characters are kept.
+ */
+function parseTreeLine(line: string): string | null {
+  const label = /^(?:\*\*[Pp]rinted:\*\*|[Pp]rinted:)\s+/;
+  let t = line.trim().replace(/^(?:[-*>]\s+|\d+[.)]\s+|#+\s+)/, '');
+  const echoed = /\s(?:\*\*[Pp]rinted:\*\*|[Pp]rinted:)\s+(?=\S)/.exec(t);
+  if (echoed && t.startsWith('cd ')) t = t.slice(echoed.index + 1);
+  t = t.replace(label, '');
+  for (const w of ['**', '`']) if (t.length > 2 * w.length && t.startsWith(w) && t.endsWith(w)) t = t.slice(w.length, -w.length).trim();
+  t = t.replace(label, '');
+  const m = /^(?:\*\*REVIEWED_TREE:\*\*|REVIEWED_TREE:)\s+`?([0-9a-f]{40,64})`?\s+(.+)$/.exec(t);
+  if (!m) return null;
+  const p = m[2]!.length > 2 && m[2]!.startsWith('`') && m[2]!.endsWith('`') ? m[2]!.slice(1, -1) : m[2]!;
+  return `${m[1]} ${realDir(p)}`;
+}
+export const isReviewedTreeLine = (line: string) => parseTreeLine(line) !== null;
+const realDir = (p: string) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+/** The checkout a reply says it reviewed: its first REVIEWED_TREE line (a later one may be quoted inside a finding); null with none. */
+const reportedTree = (output: string): string | null => output.replace(/\r\n/g, '\n').split('\n').map(parseTreeLine).find(t => t !== null) ?? null;
+/** The fingerprint a reply must report, read from the checkout itself when its brief is rendered: "<HEAD^{tree}> <toplevel>". */
+export function checkoutTree(dir: string): string | null {
+  const git = (a: string[]) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', timeout: 30_000 });
+  const tree = git(['rev-parse', 'HEAD^{tree}']), top = git(['rev-parse', '--show-toplevel']);
+  return tree.status === 0 && top.status === 0 ? `${tree.stdout.trim()} ${realDir(top.stdout.trim())}` : null;
+}
+/** moved: the reply reviewed the named checkout, but at another tree than the one its brief was rendered on. */
+export type TreeCheck = { ok: boolean; moved: boolean; expected: string; reported: string };
+/** Whether a reply's REVIEWED_TREE line is the fingerprint recorded when its brief was rendered (GST-482). */
+export function checkReviewedTree(output: string, expected: string | null): TreeCheck {
+  const reported = reportedTree(output);
+  const ok = expected !== null && reported === expected;
+  const top = (t: string) => t.slice(t.indexOf(' ') + 1);
+  return { ok, moved: !ok && !!reported && expected !== null && top(reported) === top(expected),
+    expected: expected ?? 'none (the checkout was unreadable at render)', reported: reported ?? 'none' };
+}
+
+/** The file a rendered brief is written to under the run's briefs directory. */
+export function briefFile(role: BriefRole, name?: string): string {
+  return `${role}${name ? `-${name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : ''}.prompt.md`;
+}

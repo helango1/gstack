@@ -41,14 +41,14 @@ function sh(cwd: string, env: Record<string, string>, args: string[]): string {
 }
 
 /** A bare origin with main carrying the given base files, and a clone on branch `results`. */
-function scratch(baseFiles: Record<string, string | Buffer>): Scratch {
+function scratch(baseFiles: Record<string, string | Buffer>, objectFormat: 'sha1' | 'sha256' = 'sha1'): Scratch {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sealed-guard-')));
   const work = path.join(root, 'work'); const origin = path.join(root, 'origin.git'); const state = path.join(root, 'state');
   fs.mkdirSync(work); fs.mkdirSync(state);
   const env = { HOME: root, GSTACK_HOME: state, GSTACK_STATE_ROOT: state, GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' };
-  fs.writeFileSync(env.GIT_CONFIG_GLOBAL, '[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n');
-  spawnSync('git', ['init', '-q', '--bare', origin], { env: { ...process.env, ...env }, timeout: 30_000 });
-  sh(work, env, ['init', '-q', '-b', 'main']);
+  fs.writeFileSync(env.GIT_CONFIG_GLOBAL, `[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n`);
+  spawnSync('git', ['init', '-q', '--bare', `--object-format=${objectFormat}`, origin], { env: { ...process.env, ...env }, timeout: 30_000 });
+  sh(work, env, ['init', '-q', '-b', 'main', `--object-format=${objectFormat}`]);
   write(work, { 'README.md': '# evals\n', ...baseFiles });
   sh(work, env, ['add', '-A']); sh(work, env, ['commit', '-q', '-m', 'base']);
   sh(work, env, ['remote', 'add', 'origin', origin]);
@@ -102,6 +102,36 @@ describe('pre-push hook: public destination refuses each kind of sealed output',
     }
   });
 
+  test('local_path matches a home path after every shell parameter-expansion operator, and still skips hyphenated words', () => {
+    const positives = [
+      'RUNNER="${UBI_RUNNER:-/home/user/.capy/drive/runner}"',
+      'RUNNER="${UBI_RUNNER-/home/user/runner}"',
+      'RUNNER="${UBI_RUNNER:=/home/user/runner}"',
+      'RUNNER="${UBI_RUNNER:+/Users/bob/runner}"',
+      'RUNNER="${UBI_RUNNER:?/home/user/runner}"',
+      'ROOT="${1:-/Users/bob/work}"',
+      'ROOT="${@:-/home/user/work}"',
+      'ROOT="${arr[0]:-/home/user/work}"',
+      'ROOT="${!ref:-/home/user/work}"',
+      'ROOT="${WIN_ROOT:-C:\\Users\\bob\\work}"',
+      'const dir = process.env.UBI_WORK ?? "/home/ubi/work";',
+    ];
+    const negatives = [
+      'see docs-/home/user/x for the old layout',
+      'mount at data-/Users/bob/cache',
+      'RUNNER="$UBI_RUNNER-/home/user/runner"',
+      'RUNNER="${UBI_RUNNER}-/home/user/runner"',
+      'RUNNER="${UBI_RUNNER:-./runner}"',
+      'a well-known, self-hosted, run-to-completion job',
+    ];
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    commit(s, { 'runner/launch.sh': [...positives, ...negatives].join('\n') + '\n' });
+    const r = hook(s);
+    expect(r.code).toBe(1);
+    const flagged = [...r.err.matchAll(/sealed\.local_path\s+runner\/launch\.sh:(\d+)/g)].map(m => Number(m[1]));
+    expect(flagged).toEqual(positives.map((_, i) => i + 1));
+  });
+
   test('path rules ignore content: a binary file, an empty transcript, an add-then-delete and a rename into a sealed path all refuse', () => {
     const binary = scratch({ '.gstack/pregate.json': policy(SEALED) });
     commit(binary, { 'heldout/questions.bin': Buffer.from([0, 1, 2, 0, 255, 0]) });
@@ -145,7 +175,7 @@ describe('policy union, waivers, private destinations and fail-closed parsing', 
   test('a waiver counts only from the base branch allow file and is listed; the same line committed in the push is ignored', () => {
     const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
     const sha = commit(s, { 'runs/c1/transcript.jsonl': '{}\n' });
-    const allow = `# rule\tpath\tsha\treason\nsealed.transcript\truns/c1/transcript.jsonl\t${sha.slice(0, 12)}\tsynthetic fixture, no sealed content\n`;
+    const allow = `# rule\tpath\tsha\treason\nsealed.transcript\truns/c1/transcript.jsonl\t${sha}\tsynthetic fixture, no sealed content\n`;
     commit(s, { '.gstack/sealed-allow.tsv': allow });
     expect(hook(s).code).toBe(1);
     sh(s.work, s.env, ['checkout', '-q', 'main']);
@@ -185,7 +215,7 @@ describe('gstack-pregate sealed (the standalone preflight before any push or PR 
     const ranged = run(['--range', 'origin/main..HEAD', '--base', 'main']);
     expect(ranged.status).toBe(1);
     expect(ranged.stderr).toMatch(/sealed\.transcript\s+runs\/c1\/transcript\.jsonl/);
-    expect(ranged.stdout).toMatch(/^SEALED: refused findings=1 commits=1 visibility=unknown \(counted public\)/m);
+    expect(ranged.stdout).toMatch(/^SEALED: refused findings=1 commits=1 skipped=0 visibility=unknown \(counted public\)/m);
     const dflt = run(['--base', 'main']);
     expect(dflt.status).toBe(1);
     sh(s.work, s.env, ['push', '-q', 'origin', 'results']);
@@ -222,7 +252,7 @@ describe('sealed.allow_paths: base-branch exceptions applied after the deny glob
     expect(hook(only).code).toBe(0);
     const pre = preflight(only);
     expect(pre.code).toBe(0);
-    expect(pre.out).toMatch(/^SEALED: clear findings=0 commits=1 visibility=unknown \(counted public\) waived=0 exempt=1 policy=/m);
+    expect(pre.out).toMatch(/^SEALED: clear findings=0 commits=1 skipped=0 visibility=unknown \(counted public\) waived=0 exempt=1 policy=/m);
     const json = JSON.parse(preflight(only, ['--json']).out);
     expect(json.exempt).toHaveLength(1);
     expect(json.exempt[0]).toMatchObject({ rule: 'sealed.path', file: 'sealed/s1/MANIFEST.json', glob: '**/sealed/*/MANIFEST.json' });
@@ -267,7 +297,7 @@ describe('sealed.allow_paths: base-branch exceptions applied after the deny glob
   test('an exception covers sealed.transcript too and is counted before a base sha waiver, never both', () => {
     const s = scratch({ '.gstack/pregate.json': policy({ paths: ['**/sealed/**'], transcripts: ['**/transcript*.jsonl'], allow_paths: ['**/sealed/*/transcript-public.jsonl'] }) });
     const sha = commit(s, { 'sealed/s1/transcript-public.jsonl': '{}\n' });
-    landOnMain(s, { '.gstack/sealed-allow.tsv': `sealed.transcript\tsealed/s1/transcript-public.jsonl\t${sha.slice(0, 12)}\tsynthetic fixture\n` });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': `sealed.transcript\tsealed/s1/transcript-public.jsonl\t${sha}\tsynthetic fixture\n` });
     const pre = preflight(s);
     expect(pre.code).toBe(0);
     expect(pre.err).toContain('exempt sealed.transcript  sealed/s1/transcript-public.jsonl');
@@ -371,4 +401,169 @@ describe('gstack-pregate sealed is a check, not a push (#3565)', () => {
     expect(sh(s.work, s.env, ['ls-remote', 'origin'])).toBe(before);
     expect(before).not.toContain('refs/heads/results');
   });
+});
+
+describe('waivers name the full commit sha (GST-268)', () => {
+  const TRANSCRIPT = 'runs/c1/transcript.jsonl';
+  const line = (sha: string) => `sealed.transcript\t${TRANSCRIPT}\t${sha}\tsynthetic fixture\n`;
+
+  const PREFIX = 'must name the full lowercase commit sha';
+  const OTHER = 'it names another commit';
+  const SHORT: Array<[string, (x: string) => string, string]> = [['a 7-character prefix', x => x.slice(0, 7), PREFIX], ['a 12-character prefix', x => x.slice(0, 12), PREFIX], ['a 39-character prefix', x => x.slice(0, 39), PREFIX], ['an uppercase sha', x => x.toUpperCase(), PREFIX], ['one extra character', x => `${x}a`, OTHER]];
+  test.each(SHORT)('%s does not waive and is named as ignored with the full commit', (_label, cut, why) => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const sha = commit(s, { [TRANSCRIPT]: '{}\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': line(cut(sha)) });
+    const h = hook(s);
+    expect(h.code).toBe(1);
+    expect(h.err).toContain(`ignored waiver sealed.transcript  ${TRANSCRIPT}  sha ${cut(sha)}`);
+    expect(h.err).toContain(`${why}; this finding is in commit ${sha}, review it before waiving)`);
+    const pre = preflight(s);
+    expect(pre.code).toBe(1);
+    expect(pre.out).toMatch(/^SEALED: refused findings=1 .* waived=0 /m);
+    expect(JSON.parse(preflight(s, ['--json']).out).ignoredWaivers).toEqual([{ rule: 'sealed.transcript', path: TRANSCRIPT, sha: cut(sha), commit: sha }]);
+  });
+
+  test('the full 40-character sha waives, trailing whitespace included, with no ignored note', () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const sha = commit(s, { [TRANSCRIPT]: '{}\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': line(`${sha} `) });
+    const r = hook(s);
+    expect(r.code).toBe(0);
+    expect(r.err).toContain(`waived sealed.transcript  ${TRANSCRIPT}`);
+    expect(r.err).not.toContain('ignored waiver');
+    expect(JSON.parse(preflight(s, ['--json']).out).ignoredWaivers).toEqual([]);
+  });
+
+  test("the full sha of a different commit does not waive this commit's file at the same path", () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const first = commit(s, { [TRANSCRIPT]: '{}\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': line(first) });
+    sh(s.work, s.env, ['reset', '-q', '--hard', 'origin/main']);
+    const second = commit(s, { [TRANSCRIPT]: '{"other":1}\n' });
+    const r = hook(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(`ignored waiver sealed.transcript  ${TRANSCRIPT}  sha ${first}`);
+    expect(r.err).toContain(`it names another commit; this finding is in commit ${second}`);
+  });
+
+  test("a short waiver for an older commit is named as another commit, never as this commit's shortened sha", () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const first = commit(s, { [TRANSCRIPT]: '{}\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': line(first.slice(0, 7)) });
+    sh(s.work, s.env, ['reset', '-q', '--hard', 'origin/main']);
+    const second = commit(s, { [TRANSCRIPT]: '{"other":1}\n' });
+    expect(second.startsWith(first.slice(0, 7))).toBe(false);
+    const r = hook(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(`ignored waiver sealed.transcript  ${TRANSCRIPT}  sha ${first.slice(0, 7)} (${OTHER}; this finding is in commit ${second}, review it before waiving)`);
+    expect(r.err).not.toContain(PREFIX);
+  });
+
+  test('a short waiver line on the base branch prints nothing on a push with no matching finding', () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED), '.gstack/sealed-allow.tsv': line('abc1234') });
+    commit(s, { 'notes.md': 'ok\n' });
+    const r = hook(s);
+    expect(r.code).toBe(0);
+    expect(r.err).not.toContain('ignored waiver');
+  });
+
+  const SHA256: Array<[string, (x: string) => string, boolean]> = [['the full 64 characters waive', x => x, true], ['a 40-character prefix does not', x => x.slice(0, 40), false], ['a 63-character prefix does not', x => x.slice(0, 63), false], ['65 characters do not', x => `${x}a`, false]];
+  test.each(SHA256)('a SHA-256 repository: %s', (_label, cut, waives) => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) }, 'sha256');
+    const sha = commit(s, { [TRANSCRIPT]: '{}\n' });
+    expect(sha).toMatch(/^[0-9a-f]{64}$/);
+    landOnMain(s, { '.gstack/sealed-allow.tsv': line(cut(sha)) });
+    const pre = preflight(s);
+    expect(pre.code).toBe(waives ? 0 : 1);
+    expect(pre.err.includes('ignored waiver')).toBe(!waives);
+    if (!waives) expect(pre.err).toContain(`${cut(sha).length < 64 ? PREFIX : OTHER}; this finding is in commit ${sha}, review it before waiving)`);
+  });
+
+  test('a waiver that applied in one commit is not reported as ignored for a later commit at the same path', () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const first = commit(s, { 'notes/a.md': 'SEALED ANSWER: b\n' });
+    const second = commit(s, { 'notes/a.md': 'SEALED ANSWER: b\nSEALED ANSWER: c\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': `sealed.answer\tnotes/a.md\t${first}\tsynthetic fixture\n` });
+    const j = JSON.parse(preflight(s, ['--json']).out);
+    expect(j.waived.map((w: { commit: string }) => w.commit)).toEqual([first]);
+    expect(j.findings.map((f: { commit: string }) => f.commit)).toEqual([second]);
+    expect(j.ignoredWaivers).toEqual([]);
+  });
+
+  test('a short waiver for a text rule with several matching lines is named once', () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    const sha = commit(s, { 'notes/a.md': 'SEALED ANSWER: b\nSEALED ANSWER: c\n' });
+    landOnMain(s, { '.gstack/sealed-allow.tsv': `sealed.answer\tnotes/a.md\t${sha.slice(0, 7)}\tsynthetic fixture\n` });
+    const j = JSON.parse(preflight(s, ['--json']).out);
+    expect(j.findings).toHaveLength(2);
+    expect(j.ignoredWaivers).toEqual([{ rule: 'sealed.answer', path: 'notes/a.md', sha: sha.slice(0, 7), commit: sha }]);
+  });
+
+  test('an error report carries an empty ignoredWaivers list', () => {
+    const s = scratch({ '.gstack/pregate.json': policy(SEALED) });
+    commit(s, { 'notes.md': 'ok\n' });
+    expect(JSON.parse(preflight(s, ['--range', 'nosuch..HEAD', '--json']).out).ignoredWaivers).toEqual([]);
+  });
+});
+
+const PANEL = JSON.stringify({ units: [
+  { stratum: 'decoy', tags: ['W:T1'], plan_bytes: 3760, files: 5, head: '5b7db3aa' + '1'.repeat(32), tree_sha256: '15762a' + '0'.repeat(56) + 'aa' },
+  { stratum: 'seeded', tags: ['B:T2'], plan_bytes: 4112, files: 7, head: '9c1e0bbb' + '2'.repeat(32), tree_sha256: '88aa11' + '0'.repeat(56) + 'bb' },
+] }, null, 2) + '\n';
+const PANEL_VALUES = [/5b7db3aa/, /15762a0/, /9c1e0bbb/, /88aa110/, /\b3760\b/, /\b4112\b/, /W:T1/, /B:T2/, /\bdecoy\b/, /\bseeded\b/];
+
+describe('sealed.label_join: labels published beside self-computable identifiers (GST-620)', () => {
+  test('the GSTA-2 panel (stratum and tags beside head, tree_sha256, plan_bytes, files) refuses on a public destination and warns on a private one, naming fields, never values', () => {
+    const labeled = { paths: ['**/heldout*/**'], label_keys: ['stratum', 'tags', 'decoy_set'] };
+    const s = scratch({ '.gstack/pregate.json': policy(labeled) });
+    const sha = commit(s, { 'wiki/board/panel/panel.json': PANEL });
+    const keys = ['stratum', 'tags', 'files', 'head', 'plan_bytes', 'tree_sha256'];
+    const text = preflight(s);
+    expect(text.code).toBe(1);
+    expect(text.err).toContain(`sealed.label_join  wiki/board/panel/panel.json  commit ${sha.slice(0, 12)}  keys=${keys.join(',')}`);
+    expect(text.out).toMatch(/^SEALED: refused findings=1 commits=1 /m);
+    const json = preflight(s, ['--json']);
+    expect(JSON.parse(json.out).findings).toEqual([{ rule: 'sealed.label_join', file: 'wiki/board/panel/panel.json', commit: sha, keys }]);
+    const h = hook(s);
+    expect(h.code).toBe(1);
+    expect(h.err).toContain(`sealed.label_join  wiki/board/panel/panel.json  commit ${sha.slice(0, 12)}  keys=${keys.join(',')}`);
+    for (const out of [text.out, text.err, json.out, h.err]) for (const value of PANEL_VALUES) expect(out).not.toMatch(value);
+    const priv = scratch({ '.gstack/pregate.json': policy({ ...labeled, visibility: 'private' }) });
+    commit(priv, { 'wiki/board/panel/panel.json': PANEL });
+    const p = preflight(priv);
+    expect(p.code).toBe(0);
+    expect(p.err).toMatch(/warning.*sealed\.label_join\s+wiki\/board\/panel\/panel\.json/s);
+  });
+});
+
+const OFF_GOLDEN = path.join(ROOT, 'test', 'fixtures', 'sealed-guard-off-golden.json');
+/** Representative pushes under policies without label_keys, each read three ways: the preflight's text and --json, and the pre-push hook. */
+function offRuns(): Record<string, unknown> {
+  const table = '| unit | stratum | head |\n|---|---|---|\n| u1 | decoy | 5b7db3a |\n';
+  const fixtures: Record<string, () => Scratch> = {
+    refused: () => { const s = scratch({ '.gstack/pregate.json': policy(SEALED) }); commit(s, { 'wiki/board/panel/panel.json': PANEL, 'runs/c1/transcript.jsonl': '{}\n', 'runs/c1/summary.md': 'SEALED ANSWER: x\n' + table }); return s; },
+    clear: () => { const s = scratch({ '.gstack/pregate.json': policy({ paths: ['heldout/**'] }) }); commit(s, { 'wiki/board/panel/panel.json': PANEL, 'wiki/board.md': table, 'wiki/units.csv': 'stratum,head\ndecoy,5b7db3a\n' }); return s; },
+    exempt: () => { const s = scratch({ '.gstack/pregate.json': policy(MANIFEST) }); commit(s, { 'sealed/s1/MANIFEST.json': PANEL, 'wiki/board/panel/panel.json': PANEL }); return s; },
+    waived: () => { const s = scratch({ '.gstack/pregate.json': policy(SEALED) }); const sha = commit(s, { 'runs/c1/transcript.jsonl': '{}\n', 'wiki/panel.json': PANEL }); landOnMain(s, { '.gstack/sealed-allow.tsv': `sealed.transcript\truns/c1/transcript.jsonl\t${sha}\tsynthetic fixture\n` }); return s; },
+    warned: () => { const s = scratch({ '.gstack/pregate.json': policy({ ...SEALED, visibility: 'private' }) }); commit(s, { 'runs/c1/transcript.jsonl': '{}\n', 'wiki/panel.json': PANEL }); return s; },
+    error: () => { const s = scratch({ '.gstack/pregate.json': policy(SEALED) }); commit(s, { '.gstack/pregate.json': policy({ ...SEALED, answer_markers: ['('] }), 'wiki/panel.json': PANEL }); return s; },
+    'no-policy': () => { const s = scratch({}); commit(s, { 'wiki/panel.json': PANEL }); return s; },
+  };
+  const runs: Record<string, unknown> = {};
+  for (const [name, make] of Object.entries(fixtures)) {
+    const s = make();
+    const norm = (t: string) => t.split(s.root).join('<root>').replace(/[0-9a-f]{12,64}/g, '<sha>');
+    const text = preflight(s); const json = preflight(s, ['--json']); const h = hook(s);
+    runs[name] = { code: text.code, stdout: norm(text.out), stderr: norm(text.err), jsonCode: json.code, json: norm(json.out), hookCode: h.code, hookStderr: norm(h.err) };
+  }
+  return runs;
+}
+
+describe('off unless configured (GST-620 item 13)', () => {
+  test('without sealed.label_keys, stdout, stderr, --json, the hook and every exit code match the capture from main 2d1b55d76 byte for byte', () => {
+    const runs = offRuns();
+    if (process.env.SEALED_GUARD_GOLDEN_CAPTURE) { fs.writeFileSync(process.env.SEALED_GUARD_GOLDEN_CAPTURE, JSON.stringify(runs, null, 2) + '\n'); return; }
+    expect(runs).toEqual(JSON.parse(fs.readFileSync(OFF_GOLDEN, 'utf8')));
+  }, 120_000);
 });

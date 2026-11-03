@@ -35,7 +35,7 @@ export interface Fixture { name: string; commit: string; paths: string[]; delete
 /** clean: pass 1 finds nothing; nits: pass 1 fixes below-floor findings; blocker: pass 1 fixes a blocker; adversarial-fix: Step 11 finds a should that is fixed; fix-regression: a pass-1 fix introduces a blocker the next step finds. */
 type Scenario = 'clean' | 'nits' | 'blocker' | 'adversarial-fix' | 'fix-regression';
 const SCENARIOS: Scenario[] = ['clean', 'nits', 'blocker', 'adversarial-fix', 'fix-regression'];
-interface Call { role: string; name?: string; effort: 'full' | 'light' | 'host'; diffBytes: number }
+interface Call { role: string; name?: string; effort: 'full' | 'medium' | 'light' | 'host'; diffBytes: number }
 
 const fileBytes = (rel: string) => { try { return fs.statSync(path.join(ROOT, rel)).size; } catch { return 0; } };
 function promptBytes(role: string, name: string): number {
@@ -85,6 +85,7 @@ function newShip(f: Fixture, sc: Scenario): { calls: Call[]; ending: string } {
     const diffBytes = plan.next.step === 'fix-check' ? f.diff_bytes * FIX_CHECK_FRACTION : h.fullPasses === 0 ? f.diff_bytes : f.diff_bytes * RANGE_FRACTION;
     for (const d of plan.dispatches) calls.push({ role: d.role, name: d.name, effort: d.effort, diffBytes: d.role === 'outside-voice' ? f.diff_bytes : diffBytes });
     adversarialRan ||= plan.dispatches.some(d => d.role === 'adversarial-native');
+    if (plan.next.step === 'voices') continue;
     const o = outcomes[sc][Math.min(i, outcomes[sc].length - 1)] ?? {};
     const last = plan.next.step === 'scoped' ? 'full' : plan.next.step;
     h = { fullPasses: h.fullPasses + (last === 'full' ? 1 : 0), last, ...o };

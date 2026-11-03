@@ -195,17 +195,33 @@ function plainReview(text: string): string {
  * Code quotes text, so a severity inside a fence or an inline code span is not
  * a label. An inline span holding only a severity token in label position
  * (`- \`P1\`: x`, `Severity: \`High\``, a table cell) is formatting and stays.
+ * `readUnclosed` reads a fence that never closes as prose instead (GST-436): the
+ * blocking signals use that view, so an unclosed fence cannot hide a later `[P1]`
+ * or `Verdict: not ready`, while the evidence for clean keeps it blanked. One pass:
+ * an opener closes only when a later marker of its kind is at least as long.
  */
 const CODE_LABEL_BEFORE = /^[\t ]*(?:>[\t ]*)?(?:#{1,6}[\t ]+|[-+*][\t ]+|\(?\d{1,3}[.)][\t ]+)?(?:\*\*|__)?$|\b(?:severity|priority)[\t ]*[:=][\t ]*(?:\*\*|__)?$|\|[\t ]*(?:\*\*)?$/i;
-function withoutCode(text: string): string {
+function withoutCode(text: string, readUnclosed = false): string {
+  const lines = text.split(/\r?\n/);
+  const markers = lines.map(line => /^[\t ]*(`{3,}|~{3,})/.exec(line)?.[1]);
+  const closes = markers.map(() => true);
+  if (readUnclosed) {
+    const longestLater: Record<string, number> = { '`': 0, '~': 0 };
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = markers[i];
+      if (!m) continue;
+      closes[i] = longestLater[m[0]!]! >= m.length;
+      longestLater[m[0]!] = Math.max(longestLater[m[0]!]!, m.length);
+    }
+  }
   let fence: string | undefined;
-  return text.split(/\r?\n/).map(line => {
-    const marker = /^[\t ]*(`{3,}|~{3,})/.exec(line)?.[1];
+  return lines.map((line, i) => {
+    const marker = markers[i];
     if (fence) {
       if (marker && marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
       return '';
     }
-    if (marker) { fence = marker; return ''; }
+    if (marker) { if (closes[i]) fence = marker; return ''; }
     return line.replace(/`([^`]+)`/g, (span, inner: string, at: number) =>
       inner.trim() === 'NO_FINDINGS' || /^\[?(?:P[0-3]|critical|high|medium|low)\]?$/i.test(inner.trim()) && CODE_LABEL_BEFORE.test(line.slice(0, at)) ? inner : ' ');
   }).join('\n');
@@ -243,9 +259,12 @@ export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewC
   const plain = plainReview(input.text);
   const reviewed = input.gate !== 'proposal';
   const code = withoutCode(input.text), plainCode = plainReview(code);
-  const levels = [...[...plainCode.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].map(m => (m[1] ?? m[2]) as Severity),
-    ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
+  const read = withoutCode(input.text, true), plainRead = plainReview(read);
+  const levelsOf = (c: string, p: string) => [...[...p.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].map(m => (m[1] ?? m[2]) as Severity),
+    ...severityTokens(c), ...(reviewed ? severityWords(c) : [])];
+  const levels = levelsOf(read, plainRead);
   const findings = { highest: levels.length ? levels.sort()[0]! : null };
+  const cleanEvidence = levelsOf(code, plainCode).length > 0;
   const ran = execution(input);
   if (ran.state === 'unavailable') return { execution: ran, findings, verdict: 'unavailable', reason: ran.reason, detail: ran.detail };
   const blocking = findings.highest === 'P0' || findings.highest === 'P1';
@@ -262,12 +281,12 @@ export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewC
     return result('unavailable', 'missing_markers', 'missing review completion recommendation');
   }
   if (!reviewed) return result(blocking ? 'findings' : 'clean');
-  const unparsed = firstUnparsed(code);
+  const unparsed = firstUnparsed(read);
   // A last explicit not-ready blocks even when the only parsed severities are advisory.
-  const notReady = verdictNotReady(plainCode);
+  const notReady = verdictNotReady(plainCode) || verdictNotReady(plainRead);
   if (blocking || notReady) return { ...result('findings'), ...(unparsed ? { unparsed } : {}) };
   if (unparsed) return { ...result('unverified', 'unparsed_severity', unparsed), unparsed };
-  if ((input.gate === 'structured' || input.gate === 'review') && !findings.highest && !concludesNoFindings(code)) {
+  if ((input.gate === 'structured' || input.gate === 'review') && !cleanEvidence && !concludesNoFindings(code)) {
     return result('unverified', 'untagged_review', 'missing severity or explicit no-findings conclusion');
   }
   return result('clean');
@@ -277,6 +296,43 @@ const LEGACY_REASONS: Partial<Record<GateReason, string>> = {
   empty_response: 'empty response',
   review_refused: 'review refused',
 };
+
+export interface TokenUsage {
+  input_tokens?: number; cached_input_tokens?: number; cache_write_input_tokens?: number;
+  output_tokens?: number; reasoning_output_tokens?: number; total_tokens?: number; usd: number | 'unknown';
+}
+const USAGE_COUNTERS = ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'] as const;
+
+/**
+ * Token usage from `codex exec --json` events, read loosely. A cumulative
+ * `total_token_usage` snapshot (info, payload.info or msg.info) wins, latest first;
+ * without one, the latest `usage` object does: codex exec fills turn.completed.usage
+ * with the session's running total, so summing turns would overcount. Only the
+ * counters the events carry are reported.
+ */
+export function usageFromEvents(events: string): TokenUsage {
+  let cumulative: Record<string, unknown> | undefined;
+  let latest: Record<string, unknown> = {};
+  for (const line of events.split('\n')) {
+    if (!line.trim()) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    const snapshot = obj?.info?.total_token_usage ?? obj?.payload?.info?.total_token_usage ?? obj?.msg?.info?.total_token_usage;
+    if (snapshot && typeof snapshot === 'object') { cumulative = snapshot; continue; }
+    if (!obj?.usage || typeof obj.usage !== 'object') continue;
+    latest = obj.usage;
+  }
+  const source = cumulative ?? latest;
+  const usage: TokenUsage = { usd: 'unknown' };
+  for (const key of USAGE_COUNTERS) if (typeof source[key] === 'number') usage[key] = source[key] as number;
+  return usage;
+}
+
+/** The OUTSIDE_USAGE line: counters the events carried, or `unknown` when they carried none. */
+export function formatUsageLine(usage: TokenUsage): string {
+  const parts = USAGE_COUNTERS.filter(key => usage[key] !== undefined).map(key => `${key.replace(/_tokens$/, '')}=${usage[key]}`);
+  return `OUTSIDE_USAGE: ${parts.length ? parts.join(' ') : 'unknown'}`;
+}
 
 /** Text-only compatibility shape for direct importers (claude-code/SKILL.md.tmpl) and the two-argument CLI. */
 export function validateOutsideReview(text: string, gate: OutsideGate): { completed: boolean; reason?: string; score?: number; gate?: 'pass' | 'fail' } {
@@ -328,12 +384,13 @@ if (import.meta.main) {
     if (!result.completed) { console.error(`Outside review unavailable: ${result.reason}; missing coverage.`); process.exit(1); }
     process.exit(0);
   }
-  const checked = classifyOutsideReview({ text, gate: gate as OutsideGate, exit,
-    stderr: await readOptional(flags['--stderr']), events: await readOptional(flags['--events']) });
+  const events = await readOptional(flags['--events']);
+  const checked = classifyOutsideReview({ text, gate: gate as OutsideGate, exit, stderr: await readOptional(flags['--stderr']), events });
   const label = flags['--label'] ?? 'Outside review';
   console.log(`VERDICT: ${checked.verdict}`);
   console.log(`FINDINGS: ${checked.findings.highest ?? (checked.verdict === 'findings' ? 'unspecified' : 'none')}`);
   if (checked.unparsed) console.log(`UNPARSED: ${checked.unparsed}`);
+  if (flags['--events'] !== undefined) console.log(formatUsageLine(usageFromEvents(events)));
   if (checked.reason) {
     console.log(`REASON: ${checked.reason}`);
     console.error(gateOutcomeLine(label, checked.reason, checked.detail));
