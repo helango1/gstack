@@ -1146,11 +1146,12 @@ cmd_pack() {
     done < <(git -C "$gitdir" config --local --null --get-regexp '^(remote|branch)\.' 2>/dev/null || true)
     # The checkout's index rides along so the VM's status matches; a split
     # index's shared half lives only in the original git dir, so the copy is
-    # unsplit (read through $src's git dir) before it ships. The index's blobs that HEAD's tree lacks (staged, intent-to-add, the stages
-    # of an unmerged entry) are behind no ref, so they travel as a pack of
-    # their own; without them the VM's write-tree (gstack-wtree) cannot read a
-    # staged file. cat, not cp: git renames index.lock over the index, which
-    # cp reports as "replaced while being copied"; one open() reads one whole index.
+    # unsplit (read through $src's git dir) before it ships. The index's blobs
+    # that HEAD's tree lacks (staged, intent-to-add, the stages of an unmerged
+    # entry) are behind no ref, so they travel as a pack of their own; without
+    # them the VM's write-tree (gstack-wtree) cannot read a staged file. cat,
+    # not cp: git renames index.lock over the index, which cp reports as
+    # "replaced while being copied"; one open() reads one whole index.
     cat "$(cd "$src" && cd "$(dirname "$(git rev-parse --git-path index)")" && pwd)/index" > "$tmp/.git/index"
     GIT_INDEX_FILE="$tmp/.git/index" git -C "$src" -c core.splitIndex=false update-index --no-split-index \
       || die "pack: could not unsplit the index copy of $src"

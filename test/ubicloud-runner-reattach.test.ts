@@ -185,6 +185,8 @@ describe('ubi-runner run, verify and quota against a fake API and a fake ssh', (
       };
       probe('plain index');
       git('config', 'core.splitIndex', 'true'); git('update-index', '--split-index');
+      const shared = () => readdirSync(join(repo, '.git')).filter(n => n.startsWith('sharedindex.')).length;
+      const sharedBefore = shared();
       probe('core.splitIndex=true');
       // A split index's run reaches the VM with the index unsplit, and the VM's tree matches this side's:
       // with the file tracked, untracked in the index only, and with the split but no core.splitIndex.
@@ -196,6 +198,8 @@ describe('ubi-runner run, verify and quota against a fake API and a fake ssh', (
         return r.stdout.toString();
       };
       expect(vmRun('split')).toContain('one\n');
+      // The run key, pack and tree check work on copies only: no new shared index lands in the checkout's .git.
+      expect(shared()).toBe(sharedBefore);
       // New content, so the keep.log the fake VM kept from the run before cannot stand in for this one.
       git('rm', '-q', '--cached', 'keep.log'); writeFileSync(join(repo, 'keep.log'), 'three\n');
       vmRun('split, rm --cached');
