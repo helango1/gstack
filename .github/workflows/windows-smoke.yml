@@ -92,6 +92,14 @@ jobs:
           bun -e 'Bun.serve({ hostname: "127.0.0.1", port: 47124, fetch: () => new Response("<title>gstack smoke</title><h1>gstack-windows-smoke-ok</h1>", { headers: { "content-type": "text/html" } }) }); setInterval(() => {}, 1 << 30);' &
           PAGE_PID=$!
           trap 'kill "$PAGE_PID" 2>/dev/null || true; "$BROWSE" stop >/dev/null 2>&1 || true' EXIT
+          # Bun.serve binds after bun starts: wait for the page, so a slow start fails
+          # here by name instead of as a refused goto.
+          for i in $(seq 1 100); do
+            curl -sf --max-time 2 -o /dev/null http://127.0.0.1:47124/ && break
+            kill -0 "$PAGE_PID" 2>/dev/null || (echo "page server exited before it answered" && exit 1)
+            [ "$i" -lt 100 ] || (echo "page server did not answer on 127.0.0.1:47124" && exit 1)
+            sleep 0.2
+          done
           mkdir -p "$RUNNER_TEMP/unrelated-dir" && cd "$RUNNER_TEMP/unrelated-dir"
           set +e
           OUT=$(printf '%s\n' '[["goto","http://127.0.0.1:47124/"],["text"]]' | "$BROWSE" chain 2>&1)

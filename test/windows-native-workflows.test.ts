@@ -126,7 +126,12 @@ test('windows-smoke is the PR gate: every pull request and main push, one window
   const start = step('The core skills start').run;
   expect(start).toContain('for skill in ship review qa-only investigate browse; do');
   expect(start).toContain("grep -q '^SKILL_START_PROTO: 1'");
-  expect(step("/browse on gstack's own browser runs a piped chain flow from an unrelated directory").run).toContain('| "$BROWSE" chain');
+  const browse: string = step("/browse on gstack's own browser runs a piped chain flow from an unrelated directory").run;
+  expect(browse).toContain('| "$BROWSE" chain');
+  // The page server starts in the background; the chain's goto must wait for it to answer.
+  const poll = browse.indexOf('curl -sf --max-time 2 -o /dev/null http://127.0.0.1:47124/ && break');
+  expect(poll).toBeGreaterThan(browse.indexOf('PAGE_PID=$!'));
+  expect(poll).toBeLessThan(browse.indexOf('| "$BROWSE" chain'));
   const tests = step('Fastest Windows-safe free tests for install and the core skills');
   expect(tests.run).toContain('bun run scripts/test-free-shards.ts --files-from "$RUNNER_TEMP/windows-smoke-files.txt"');
   expect(tests.env.GSTACK_FREE_RETRY_FLAKY).toBe('1');
