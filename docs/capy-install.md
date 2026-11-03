@@ -31,7 +31,8 @@ the root they checked.
 
 A dispatched reviewer (an /autoplan voice, a second opinion) reads a plan and
 reports; it runs no workflow. `--for review-voice` gives its machine a real
-trailer in seconds: clone or fast-forward, Bun at gstack's own supported
+trailer in seconds: a clone when absent (an existing checkout is used as it
+is, unless it is below the supported minimum), Bun at gstack's own supported
 minimum (the project's pins are not applied, since no repo tests run there; the
 trailer says `pins: skipped (helper runtime)`), no `./setup`, no host profiles
 and no bun shim. The doctor certifies only the read-only helpers (`PASS
@@ -47,7 +48,23 @@ upgrade: a reviewer later asked to run a workflow runs the same installer
 install in place to --for <skill> (same checkout ...; no second clone)`),
 applies the project's pins, runs `./setup` and both host profiles, and writes
 the workflow's verdict over the reviewer's. Nothing is removed and nothing is
-cloned twice. Every /autoplan reviewer prompt
+cloned twice. A review-voice session never self-upgrades the checkout, because
+the lane on the same machine may be in the middle of a workflow on it: when
+origin is ahead it prints `SELF_UPGRADE: skipped (review-voice never
+self-upgrades a shared checkout; …)`, certifies the installed revision and
+stays ok with `behind=<n> … (UPGRADE_SKIPPED); fix: <root>/bin/gstack-upgrade`.
+The bootstrapper still fast-forwards a checkout below the supported minimum,
+for a reviewer too (GST-395): below it every session's trailer on that checkout
+fails (REVISION_BELOW_MINIMUM), the lane's own next install would move it
+anyway, and the minimum rises only for install-honesty or security fixes.
+When a reviewer keeps a fuller verdict, it also leaves that install's launch
+environment alone (GST-401): it writes no launch file and announces the fuller
+install's own `GSTACK_LAUNCH_FILE` and `GSTACK_LAUNCH_PATH`, so the lane's
+`<verdict>.env` and `<verdict>.launch` are never rewritten and the reviewer
+runs the helpers on the Bun that verdict certified. A launch directory the
+reviewer needs for its own Bun lives under `<verdict>.profile/review-voice.launch`
+(mode 0700), never `<verdict>.launch`; a failing review-voice check removes
+`<verdict>.profile/`. Every /autoplan reviewer prompt
 ends with this command (`GSTACK TRAILER`); the warm run's budget, under 20 s,
 is measured by `test/capy-review-voice.test.ts`.
 
@@ -101,6 +118,12 @@ there is refused with the usual `--for <skill>` fix.
    note, and a project that needs the newer gstack says so with a floor
    (next section).
    `SELF_UPGRADE: none (current)` when nothing is ahead;
+   `--for review-voice` prints `SELF_UPGRADE: skipped (review-voice never
+   self-upgrades a shared checkout; fix: GSTACK_UPGRADE_FORCE=1
+   <root>/bin/gstack-upgrade when no other session uses this checkout
+   (UPGRADE_SKIPPED))` whenever origin is ahead,
+   with or without a lease, and `GSTACK_UPGRADE_FORCE=1` does not change that
+   ([reviewer machines](#reviewer-machines---for-review-voice));
    `GSTACK_CAPY_SELF_UPGRADE=off` (or `GSTACK_CAPY_AUTO_UPGRADE=0`) prints
    `SELF_UPGRADE: disabled (<variable>)`. `--check` never moves the checkout;
    behind origin it prints `gstack-capy-session: behind origin/<branch>:
@@ -163,8 +186,15 @@ session holds a workflow lease on this installation: ... (UPGRADE_BUSY))`,
 leaves the checkout where the run started and stays ok with `behind=`. Each
 `gstack-skill-start` renews the lease. On Capy the leased pid is the machine's
 long-lived `capy-server`, so the deferral ends when the lease turns 120
-minutes old, not when the process exits; `bin/gstack-upgrade` run by hand
-moves the checkout sooner. The team-mode SessionStart hook
+minutes old, not when the process exits. Every session on the machine runs
+under that same `capy-server`, so `bin/gstack-upgrade` run by hand also
+counts a `capy-server` lease under 120 minutes old (it may be a sibling's) and
+refuses with `a shared harness (capy-server, pid <p>) holds a lease <n>m old;
+… (UPGRADE_BUSY)`; `GSTACK_UPGRADE_FORCE=1` moves it sooner when no other
+session uses the checkout (GST-396). The age counts from the last renewal by
+any session, so a workflow idle for more than 120 minutes since its last
+`gstack-skill-start` can be moved by any session on the machine: Capy gives
+the shell no per-session identity to tell the leases apart. The team-mode SessionStart hook
 (`bin/gstack-session-update`) honors the same leases: it logs
 `SKIP leased pid=<p>/<age>m` to `analytics/session-update.log` and tries again at
 the next session start, without writing its hourly throttle stamp. A lease whose
@@ -211,7 +241,12 @@ keeps the lease. `bin/gstack-lease list` shows `alive|dead|stale`, and
    clone too, through `GSTACK_CAPY_CLONED`).
 2. Preflight: `git`, `curl`, `node`, `jq`, then Bun. The project's pins
    (`--project <path>`, default the git toplevel of the current directory) are
-   read with the doctor's own parser (`bin/gstack-runtime-pins.ts`: engines,
+   read (a `--project` inside a repository resolves to that repository's git
+   toplevel, so `--project <repo>/<subdir>` means `<repo>`; outside a repository
+   it resolves to the directory's real path, and a value that is not a
+   directory, such as a repo slug, exits 2 with a usage error before anything
+   runs; the pins, the doctor and the install verdict all use the resolved
+   directory) with the doctor's own parser (`bin/gstack-runtime-pins.ts`: engines,
    packageManager, `.tool-versions`, `.bun-version` and CI `bun-version:` lanes
    for this platform). CI exact pins for this platform are alternatives: a
    repository may test several Bun versions (gstack's own CI pins 1.4.2 and
@@ -423,12 +458,28 @@ GSTACK_LAUNCH_FILE: <verdict file without .json>.env
 
 `GSTACK_LAUNCH_FILE` names the same assignments as a sourceable script (mode
 0600, beside the verdict under the state root; the PATH prepend is idempotent).
+The file also appends the checkout's `bin/` directory to PATH, after everything
+already there and only once, so a shell that sourced only this file runs a bare
+`gstack-ship-budget` (GSTA-167: a /ship child got `command not found`, exit 127).
+When the session starts from the Drive skill (a bootstrapper outside the
+checkout), the file also exports `GSTACK_PREFERENCES_FILE`, the path of
+`preferences.yaml` beside that skill's SKILL.md, which the `GSTACK_LAUNCH` line
+leaves out; `gstack-models resolve --role agent` reads it
+([your model preference](model-policy.md#your-model-preference)).
 The file is part of the ok verdict: a passing run that cannot write it exits 1
 with `gstack: fail launch-file — could not write the launch file <path>; fix:
 make <dir> writable, or set GSTACK_STATE_ROOT to a writable directory
 (LAUNCH_FILE_UNWRITABLE)`, and a failing run prints no `GSTACK_LAUNCH_FILE` line
 and removes the file an earlier passing run left beside the verdict it rewrites
 (a profile check that keeps a fuller ok verdict leaves that verdict's file).
+With `--model <id>`, `GSTACK_MODEL=<id>` in its environment, or else an
+`agent_model` in the session's `GSTACK_PREFERENCES_FILE` outside an eval run (GST-982, with a
+`LOADOUT_ASSUMED:` note), an ok run other than `--for review-voice` also prints `LOADOUT: …`
+and `SKILL_ROOT: <dir>` just before `GSTACK_LAUNCH`. For a loadout other than
+`full`, `GSTACK_LAUNCH_FILE` then names `<verdict file without .json>.loadout-<name>-<digest>.env`,
+a copy of the verdict's launch file that adds `GSTACK_LOADOUT_SKILL_ROOT`; the
+verdict and its own launch file do not change, and any failure prints
+`LOADOUT_FALLBACK` and serves `full` ([loadouts](loadouts.md#capy)).
 `. <that file>` at the start of a shell applies them without ever printing them,
 which is the only way to hand them to a child agent: pass the path, never the
 values. None of the assignments is a secret, but during GSTA-96's unattended

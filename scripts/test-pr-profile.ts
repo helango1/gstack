@@ -69,6 +69,13 @@ export const PR_PROFILE_FILES: Record<string, readonly string[]> = {
 };
 
 const ROOT = path.resolve(import.meta.dir, '..');
+/** gstack's own changelog_fragments.dir (.gstack/ship-policy.json): release notes the merge step folds into CHANGELOG.md, read by no paid case (GST-400). */
+const CHANGELOG_FRAGMENTS_DIR = ((): string | null => {
+  try {
+    const dir = JSON.parse(fs.readFileSync(path.join(ROOT, '.gstack', 'ship-policy.json'), 'utf8'))?.changelog_fragments?.dir;
+    return typeof dir === 'string' && dir.trim() ? dir.replace(/^(\.\/)+/, '').replace(/\/+$/, '') : null;
+  } catch { return null; }
+})();
 
 /** The one paid test file whose source registers a case (its touchfiles name exactly one), else null. */
 export function caseOwnerFile(id: string, maps: Pick<PrProfileMaps, 'e2eTouchfiles'> = PR_PROFILE_MAPS): string | null {
@@ -230,6 +237,7 @@ export const PAID_WORKFLOW_FILES = [
 export const FREE_ONLY_PR_FILES = [
   'scripts/test-free-shards.ts',
   'scripts/lib/free-home-guard.ts', // Imported only by the free shard runner.
+  'scripts/lib/shard-jobs.ts', // Free runner's --ci-run --jobs sub-shards; ship-measure loads it through test-free-shards.ts, so its touchfiles list it.
   'test/helpers/auq-parallel-worker.ts',
   'test/helpers/stored-zip.ts', // Read only by the free test-health report tests.
   'scripts/free-test-durations.json',
@@ -237,6 +245,7 @@ export const FREE_ONLY_PR_FILES = [
   'scripts/paid-test-durations.json',
   'scripts/ubicloud/**',
   'capy/skill/**', // The vendored Capy skill (Drive bootstrapper): run by Capy agents, read by no paid case; test/capy-skill-wrapper.test.ts covers it.
+  'USING_GBRAIN_WITH_GSTACK.md', // The /setup-gbrain guide: README, docs/gbrain-quick-tour.md and free tests read it; no skill prompt or paid fixture does (GST-1027).
   'captain/templates/**', // The /captain crew templates (CREW.md, merge-ask.md, slot-call.md, …): copied into a Captain's drive by people and Captains, read by no paid case; free test/captain-skill.test.ts covers them (#3499).
   'tsconfig.test.json', // Read only by `tsc -p tsconfig.test.json` (typecheck:test); Bun's runtime reads tsconfig.json.
   '.gitignore', // Changes which untracked files git reports, never tracked content a case reads.
@@ -287,6 +296,7 @@ export const FREE_ONLY_PR_FILES = [
   '.github/workflows/windows-free-tests.yml',
   '.github/workflows/windows-pregate-e2e.yml',
   '.github/workflows/windows-setup-e2e.yml',
+  '.github/workflows/windows-smoke.yml',
 ] as const;
 
 /**
@@ -330,6 +340,7 @@ export function knownNonBehaviorFile(file: string): boolean {
     || ['AGENTS.md', 'CLAUDE.md', 'agents-digest/gstack-AGENTS.md'].includes(file)
     || FREE_ONLY_PR_FILES.some(pattern => matchGlob(file, pattern))
     || RELEASE_METADATA_FILES.some(pattern => matchGlob(file, pattern))
+    || (CHANGELOG_FRAGMENTS_DIR !== null && path.posix.dirname(file) === CHANGELOG_FRAGMENTS_DIR && file.endsWith('.md'))
     || (PERIODIC_ONLY_PR_FILES as readonly string[]).includes(file)
     || (file.startsWith('test/fixtures/') && Object.keys(FREE_FIXTURES).some(pattern => matchGlob(file, pattern)))
     // Free test files anywhere (test/, browse/test/, design/test/, make-pdf/test/): no paid case runs or reads a free test.

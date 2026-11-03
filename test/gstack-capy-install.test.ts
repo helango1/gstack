@@ -50,7 +50,7 @@ function fixture(opts: { bun?: string; jq?: boolean } = {}) {
   const log = path.join(base, 'calls.log');
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(stub, { recursive: true });
-  for (const rel of ['bin/gstack-capy-install', 'bin/gstack-bun-version.sh', 'bin/gstack-doctor-components.sh', 'bin/gstack-install-verdict.sh', 'bin/gstack-node-runtime.sh']) {
+  for (const rel of ['bin/gstack-capy-install', 'bin/gstack-bun-version.sh', 'bin/gstack-claude-root.sh', 'bin/gstack-doctor-components.sh', 'bin/gstack-install-verdict.sh', 'bin/gstack-node-runtime.sh']) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
     fs.copyFileSync(path.join(REPO, rel), path.join(root, rel));
     fs.chmodSync(path.join(root, rel), fs.statSync(path.join(REPO, rel)).mode);
@@ -154,6 +154,30 @@ describe('gstack-capy-install', () => {
     expect(run(f, ['--bogus']).status).toBe(2);
     expect(run(f, ['--for', 'qa', '--require', 'claude']).status).toBe(2);
     expect(run(f, ['--revision']).status).toBe(2);
+  });
+
+  // Value: protects=--project names the project the verdict and launch file are keyed to;
+  //   fails_when=a repo slug (owner/name) that is no directory silently keys the verdict to no project, so a later check reads a stale one;
+  //   why_new=GST-743, HARN-12 lost three pregate runs to it; seam=bin/gstack-capy-install --project; no_claim=resolving slugs
+  test('--project that is not a directory (a repo slug) is a usage error: exit 2, no setup, no verdict', () => {
+    const f = fixture();
+    const r = run(f, ['--for', 'ship', '--project', 'garrytan/harness-evals']);
+    expect([r.status, r.stderr.trim()]).toEqual([2, "gstack-capy-install: --project takes a directory path; 'garrytan/harness-evals' is not a directory (pass the project checkout's path, not a repo slug)"]);
+    expect(f.calls().filter(l => l.startsWith('setup') || l.startsWith('doctor '))).toEqual([]);
+    expect(fs.existsSync(path.join(f.home, '.gstack-state/install-verdicts'))).toBe(false);
+  });
+
+  // Value: protects=the installer keys the verdict by the project's git toplevel, the key pregate admission reads (lib/install-verdict.ts installProject);
+  //   fails_when=--project <repo>/<subdir> writes a verdict at the subdirectory's key, which admission never reads; seam=bin/gstack-capy-install --project
+  test('--project names a subdirectory: the verdict is keyed by its git toplevel, the same file --project <toplevel> writes', () => {
+    const f = fixture();
+    const project = path.join(f.base, 'proj');
+    fs.mkdirSync(path.join(project, 'packages/x'), { recursive: true });
+    sh('git init -q', project);
+    const verdictOf = (r: { stdout: string; status: number | null; stderr: string }) => { expect(r.status, r.stdout + r.stderr).toBe(0); return r.stdout.match(/GSTACK_INSTALL_VERDICT=(\S+)/)![1]!; };
+    const sub = verdictOf(run(f, ['--for', 'autoplan', '--project', path.join(project, 'packages/x')]));
+    expect(sub).toBe(verdictOf(run(f, ['--for', 'autoplan', '--project', project])));
+    expect(JSON.parse(fs.readFileSync(sub, 'utf8')).project).toBe(fs.realpathSync(project));
   });
 
   test('preflight: a missing tool stops with exit 3 and INSTALL_PREFLIGHT_FAILED before ./setup runs', () => {
@@ -514,6 +538,137 @@ describe('gstack-capy-install: launch PATH, Bun reuse, CI pins, setup skip, verd
     expect(conflict.stderr).toContain('(RUNTIME_PIN_CONFLICT; ');
   });
 
+  test('the session GSTACK_PREFERENCES_FILE is written into the launch file, so every gstack command finds the owner preferences; without it no line is written', () => {
+    const f = fixture();
+    const prefs = '/drive/skills/gstack/preferences.yaml';
+    const r = run(f, ['--for', 'autoplan'], { GSTACK_PREFERENCES_FILE: prefs });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    const launch = verdicts(f)[0].replace(/\.json$/, '.env');
+    expect(fs.readFileSync(launch, 'utf8')).toContain("export GSTACK_PREFERENCES_FILE='" + prefs + "'");
+    const plain = run(f, ['--for', 'autoplan']);
+    expect(plain.status, plain.stdout + plain.stderr).toBe(0);
+    expect(fs.readFileSync(launch, 'utf8')).not.toContain('GSTACK_PREFERENCES_FILE');
+  });
+
+  test('--model: Opus 5.5 gets the lite SKILL_ROOT and its own launch file; another model, a failed render and no --model keep the verdict and its launch file', () => {
+    const f = fixture();
+    script(path.join(f.root, 'bin/gstack-modules'), [
+      'echo "modules $*" >> "$CAPY_LOG"',
+      'model="${GSTACK_MODEL:-}" full=""; while [ $# -gt 0 ]; do case "$1" in --model) model="$2"; shift ;; --full-root) full="$2"; shift ;; esac; shift; done',
+      'case "$model" in',
+      '  claude-opus-5-5) mkdir -p "$HOME/lite-0123456789ab"; echo "LOADOUT: lite model=claude-opus-5-5 source=model-flag digest=0123456789ab reused=no"; echo "SKILL_ROOT: $HOME/lite-0123456789ab" ;;',
+      '  broken) echo "boom" >&2; exit 1 ;;',
+      '  *) echo "LOADOUT: full model=none source=model-flag reason=unmapped"; echo "SKILL_ROOT: $full" ;;',
+      'esac',
+    ]);
+    const launchOf = (out: string) => out.match(/^GSTACK_LAUNCH_FILE: (.+)$/m)![1];
+    const opus = run(f, ['--for', 'ship', '--model', 'claude-opus-5-5']);
+    expect(opus.status, opus.stdout + opus.stderr).toBe(0);
+    expect(f.calls().filter(l => l.startsWith('modules '))).toEqual([`modules install --model claude-opus-5-5 --full-root ${f.home}/.claude/skills`]);
+    expect(opus.stdout).toContain(`LOADOUT: lite model=claude-opus-5-5 source=model-flag digest=0123456789ab reused=no\nSKILL_ROOT: ${f.home}/lite-0123456789ab\n`);
+    const [verdict] = verdicts(f);
+    const base = verdict.replace(/\.json$/, '.env');
+    const lite = launchOf(opus.stdout);
+    expect(lite).toBe(verdict.replace(/\.json$/, '.loadout-lite-0123456789ab.env'));
+    expect(fs.statSync(lite).mode & 0o777).toBe(0o600);
+    expect(fs.readFileSync(lite, 'utf8')).toBe(fs.readFileSync(base, 'utf8') + `export GSTACK_LOADOUT_SKILL_ROOT='${f.home}/lite-0123456789ab'\n`);
+    expect(fs.readFileSync(base, 'utf8')).not.toContain('GSTACK_LOADOUT_SKILL_ROOT');
+    expect(lastLine(opus.stdout)).toMatch(/^gstack: ok 1\.2\.3 /);
+
+    const sonnet = run(f, ['--for', 'ship', '--model', 'claude-sonnet-5-5']);
+    expect(sonnet.status).toBe(0);
+    expect(sonnet.stdout).toContain(`LOADOUT: full model=none source=model-flag reason=unmapped\nSKILL_ROOT: ${f.home}/.claude/skills\n`);
+    expect(launchOf(sonnet.stdout)).toBe(base);
+    const broken = run(f, ['--for', 'ship', '--model', 'broken']);
+    expect(broken.stdout).toContain(`LOADOUT_FALLBACK: boom; serving full (docs/troubleshooting.md#loadout-fallback)\nLOADOUT: full model=none source=model-flag reason=render-failed\nSKILL_ROOT: ${f.home}/.claude/skills\n`);
+    expect(launchOf(broken.stdout)).toBe(base);
+    const plain = run(f, ['--for', 'ship']);
+    expect(plain.stdout).not.toMatch(/^(LOADOUT|SKILL_ROOT):/m);
+    expect(launchOf(plain.stdout)).toBe(base);
+    const fromEnv = run(f, ['--for', 'ship'], { GSTACK_MODEL: 'claude-opus-5-5' });
+    expect(fromEnv.status, fromEnv.stdout + fromEnv.stderr).toBe(0);
+    expect(launchOf(fromEnv.stdout)).toBe(lite);
+    expect(f.calls().filter(l => l.startsWith('modules ')).at(-1)).toBe(`modules install --full-root ${f.home}/.claude/skills`);
+    expect(verdicts(f)).toEqual([verdict]);
+    expect(fs.existsSync(lite)).toBe(true);
+  });
+
+  test('with no --model and no GSTACK_MODEL, the agent_model in the session preferences file picks the loadout (GST-982); GSTACK_MODEL still wins and a host preference serves full', () => {
+    const f = fixture();
+    script(path.join(f.root, 'bin/gstack-modules'), [
+      'echo "modules $*" >> "$CAPY_LOG"',
+      'model="${GSTACK_MODEL:-}" full=""; while [ $# -gt 0 ]; do case "$1" in --model) model="$2"; shift ;; --full-root) full="$2"; shift ;; esac; shift; done',
+      'case "$model" in',
+      '  claude-opus-5-5) mkdir -p "$HOME/lite-0123456789ab"; echo "LOADOUT: lite model=claude-opus-5-5 source=model-flag digest=0123456789ab reused=no"; echo "SKILL_ROOT: $HOME/lite-0123456789ab" ;;',
+      '  *) echo "LOADOUT: full model=none source=GSTACK_MODEL reason=unmapped"; echo "SKILL_ROOT: $full" ;;',
+      'esac',
+    ]);
+    script(path.join(f.root, 'bin/gstack-models'), [
+      'echo "models $* prefs=${GSTACK_PREFERENCES_FILE:-}" >> "$CAPY_LOG"',
+      '[ -z "${FAKE_BAD_MODEL:-}" ] || { echo "agent: agent_model $FAKE_BAD_MODEL is not a model"; exit 1; }',
+      '[ -z "${FAKE_CONFIG_MODEL:-}" ] || { echo "agent: anthropic/$FAKE_CONFIG_MODEL (opus) - from agent_model in $HOME/.gstack/config.yaml, this machine"; exit 0; }',
+      'case "$(sed -n "s/^agent_model: *//p" "${GSTACK_PREFERENCES_FILE:-/dev/null}" 2>/dev/null)" in',
+      '  opus) echo "agent: anthropic/claude-opus-5-5 (opus) - from agent_model in $GSTACK_PREFERENCES_FILE, the preferences file" ;;',
+      '  *) echo "agent: host - keep the running agent\'s own model and omit the model field (no preference set)" ;;',
+      'esac',
+    ]);
+    const prefs = path.join(f.home, 'drive-skill/preferences.yaml');
+    write(prefs, 'agent_model: opus\n');
+    const launchOf = (out: string) => out.match(/^GSTACK_LAUNCH_FILE: (.+)$/m)![1];
+    const opus = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs });
+    expect(opus.status, opus.stdout + opus.stderr).toBe(0);
+    expect(f.calls().filter(l => l.startsWith('modules '))).toEqual([`modules install --model claude-opus-5-5 --full-root ${f.home}/.claude/skills`]);
+    expect(opus.stdout).toContain(`LOADOUT: lite model=claude-opus-5-5 source=preferences digest=0123456789ab reused=no\nSKILL_ROOT: ${f.home}/lite-0123456789ab\n`);
+    expect(launchOf(opus.stdout)).toBe(verdicts(f)[0].replace(/\.json$/, '.loadout-lite-0123456789ab.env'));
+    expect(opus.stdout).toContain("LOADOUT_ASSUMED: model=claude-opus-5-5 is the owner's agent_model (preferences), not read from the session; a session on another model sets GSTACK_MODEL=<its id>\n");
+
+    const config = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs, FAKE_CONFIG_MODEL: 'claude-opus-5-5' });
+    expect(config.status, config.stdout + config.stderr).toBe(0);
+    expect(config.stdout).toContain('LOADOUT: lite model=claude-opus-5-5 source=config digest=0123456789ab');
+    expect(config.stdout).toContain("is the owner's agent_model (config)");
+
+    const modulesBefore = f.calls().filter(l => l.startsWith('modules ')).length;
+    for (const evalEnv of [{ GSTACK_EVAL_DIR: path.join(f.home, 'evals') }, { EVALS_RUN_ID: 'r1' }] as Record<string, string>[]) {
+      const ev = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs, ...evalEnv });
+      expect(ev.status, ev.stdout + ev.stderr).toBe(0);
+      expect(ev.stdout).not.toMatch(/^(LOADOUT|LOADOUT_ASSUMED|SKILL_ROOT):/m);
+    }
+    expect(f.calls().filter(l => l.startsWith('modules ')).length).toBe(modulesBefore);
+
+    const bad = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs, FAKE_BAD_MODEL: 'gpt-6.1-sol' });
+    expect(bad.status, bad.stdout + bad.stderr).toBe(0);
+    expect(bad.stdout).toContain('LOADOUT_FALLBACK: agent_model unreadable: agent: agent_model gpt-6.1-sol is not a model; serving full (docs/troubleshooting.md#loadout-fallback)\n');
+    expect(bad.stdout).not.toMatch(/^(LOADOUT|SKILL_ROOT):/m);
+    expect(launchOf(bad.stdout)).toBe(verdicts(f)[0].replace(/\.json$/, '.env'));
+    expect(f.calls().filter(l => l.startsWith('modules ')).length).toBe(modulesBefore);
+
+    const env = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs, GSTACK_MODEL: 'claude-sonnet-5-5' });
+    expect(env.status, env.stdout + env.stderr).toBe(0);
+    expect(f.calls().filter(l => l.startsWith('modules ')).at(-1)).toBe(`modules install --full-root ${f.home}/.claude/skills`);
+    expect(env.stdout).toContain('LOADOUT: full model=none source=GSTACK_MODEL reason=unmapped\n');
+
+    write(prefs, 'agent_model: host\n');
+    const host = run(f, ['--for', 'ship'], { GSTACK_PREFERENCES_FILE: prefs });
+    expect(host.status, host.stdout + host.stderr).toBe(0);
+    expect(host.stdout).not.toMatch(/^(LOADOUT|SKILL_ROOT):/m);
+    expect(launchOf(host.stdout)).toBe(verdicts(f)[0].replace(/\.json$/, '.env'));
+  });
+
+  test('the first line of gstack-models resolve --role agent keeps the provider/model shape the installer reads (GST-982)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gst982-'));
+    try {
+      for (const [pref, want] of [['opus', /^agent: anthropic\/claude-opus-[0-9a-z.-]+ \(opus\) /], ['host', /^agent: host /]] as const) {
+        const file = path.join(dir, `${pref}.yaml`);
+        fs.writeFileSync(file, `agent_model: ${pref}\n`);
+        const out = spawnSync(path.join(REPO, 'bin/gstack-models'), ['resolve', '--role', 'agent'], { encoding: 'utf8', timeout: 30_000, env: { ...process.env, GSTACK_PREFERENCES_FILE: file, GSTACK_STATE_ROOT: dir, GSTACK_HOME: dir } });
+        expect(out.status, out.stderr).toBe(0);
+        expect(out.stdout.split('\n')[0]).toMatch(want);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('the verdict file records checkout, HEAD, workflow, trailer and the Bun resolution, keyed by checkout and project; --check certifies without setup or downloads', () => {
     const f = fixture();
     const r = run(f, ['--for', 'autoplan']);
@@ -524,15 +679,17 @@ describe('gstack-capy-install: launch PATH, Bun reuse, CI pins, setup skip, verd
     expect(r.stdout).toContain(`GSTACK_LAUNCH_FILE: ${files[0].replace(/\.json$/, '.env')}`);
     expect(fs.readFileSync(files[0].replace(/\.json$/, '.env'), 'utf8')).toContain(`export GSTACK_INSTALL_VERDICT='${files[0]}'`);
     // /ship Step 7 value card. protects: with the certified Bun first on PATH (no GSTACK_LAUNCH_PATH)
-    // the launch file carries no PATH line, sources under POSIX sh, and leaves PATH exactly as it was;
-    // --check rewrites and prints it too. fails_when: the PATH guard is dropped (an empty prepend
-    // leaves ":"-led PATH), the file uses a bashism, or --check stops printing GSTACK_LAUNCH_FILE.
-    // why_existing_misses: the PATH-bearing case above is sourced by bash only, and the --check run
-    // below asserted only the GSTACK_LAUNCH line. seam=none.
-    const sourced = spawnSync('sh', ['-c', '. "$1" && printf "%s\\n" "$PATH" "$GSTACK_SESSION_KIND" "$GSTACK_CAPY" "$GSTACK_INSTALL_VERDICT"', '_', files[0].replace(/\.json$/, '.env')],
+    // the launch file prepends nothing, sources under POSIX sh, and only appends the checkout's bin
+    // directory once (GSTA-167: a /ship child that sourced only the launch file got
+    // `gstack-ship-budget: command not found`, exit 127); --check rewrites and prints it too.
+    // fails_when: the PATH guard is dropped (an empty prepend leaves ":"-led PATH, a second source
+    // appends the bin directory twice), the file uses a bashism, the bin directory is not on PATH,
+    // or --check stops printing GSTACK_LAUNCH_FILE. why_existing_misses: the PATH-bearing case above
+    // is sourced by bash only, and the --check run below asserted only the GSTACK_LAUNCH line. seam=none.
+    const sourced = spawnSync('sh', ['-c', '. "$1" && . "$1" && printf "%s\\n" "$PATH" "$GSTACK_SESSION_KIND" "$GSTACK_CAPY" "$GSTACK_INSTALL_VERDICT" "$(command -v gstack-paths)"', '_', files[0].replace(/\.json$/, '.env')],
       { encoding: 'utf8', timeout: 30_000, env: { PATH: '/usr/bin:/bin' } });
     expect(sourced.status, sourced.stderr).toBe(0);
-    expect(sourced.stdout.trimEnd().split('\n')).toEqual(['/usr/bin:/bin', 'unattended', '1', files[0]]);
+    expect(sourced.stdout.trimEnd().split('\n')).toEqual([`/usr/bin:/bin:${f.root}/bin`, 'unattended', '1', files[0], path.join(f.root, 'bin', 'gstack-paths')]);
     const v = JSON.parse(fs.readFileSync(files[0], 'utf8'));
     expect(v).toMatchObject({ schema_version: 2, checkout: f.root, head: sh('git rev-parse HEAD', f.root).stdout.trim(), for: 'autoplan', ok: true, trailer: 'gstack: ok 1.2.3 for=autoplan',
       project: '', bun_path: path.join(f.stub, 'bun'), bun_version: '1.4.2', bun_rule: 'PATH' });
@@ -600,6 +757,65 @@ describe('gstack-capy-install: launch PATH, Bun reuse, CI pins, setup skip, verd
     expect(c.stdout).not.toMatch(/^GSTACK_LAUNCH_FILE:/m);
     expect(fs.readFileSync(launchFile, 'utf8')).toBe(before);
     expect(JSON.parse(fs.readFileSync(launchFile.replace(/\.env$/, '.json'), 'utf8'))).toMatchObject({ ok: true });
+  });
+
+  // protects (GST-401): a profile run that keeps a fuller ok verdict borrows that install's launch
+  // file (announced, never rewritten) and a failing profile check removes only the profile's own
+  // <verdict>.profile/ directory. fails_when: the kept profile run writes the launch file again, or
+  // the failure cleanup leaves the profile directory behind or touches the lane's files.
+  test('a kept profile run borrows the fuller install\'s launch file without rewriting it; a later failing profile check removes only <verdict>.profile/', () => {
+    const f = fixture();
+    const first = run(f, ['--for', 'autoplan']);
+    expect(first.status, first.stdout + first.stderr).toBe(0);
+    const launchFile = first.stdout.match(/^GSTACK_LAUNCH_FILE: (.+)$/m)?.[1] ?? '';
+    fs.appendFileSync(launchFile, '# lane sentinel\n');
+    const before = fs.readFileSync(launchFile, 'utf8');
+    const ok = run(f, ['--for', 'review-voice']);
+    expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+    expect(ok.stdout).toContain('gstack-capy-install: kept the install verdict for=autoplan');
+    expect(ok.stdout).toContain(`GSTACK_LAUNCH_FILE: ${launchFile}\n`);
+    expect(fs.readFileSync(launchFile, 'utf8')).toBe(before);
+    const profileDir = launchFile.replace(/\.env$/, '.profile');
+    expect(fs.existsSync(path.join(profileDir, 'review-voice.env'))).toBe(false);
+    fs.mkdirSync(path.join(profileDir, 'review-voice.launch'), { recursive: true });
+    const failed = run(f, ['--check', '--for', 'review-voice'], { STUB_DOCTOR_FAIL: '1' });
+    expect(failed.status, failed.stdout + failed.stderr).toBe(1);
+    expect(fs.existsSync(profileDir)).toBe(false);
+    expect(fs.readFileSync(launchFile, 'utf8')).toBe(before);
+    expect(JSON.parse(fs.readFileSync(launchFile.replace(/\.env$/, '.json'), 'utf8'))).toMatchObject({ ok: true, for: 'autoplan' });
+  });
+
+  // protects (GST-401): a kept profile run borrows only a launch file that reaches a Bun; when the
+  // fuller install recorded no launch path but this run needs one, it writes its own
+  // <verdict>.profile/<for>.env. fails_when: the run announces the lane's file anyway (its shell
+  // would resolve an uncertified Bun) or rewrites the lane's file.
+  test.skipIf(process.platform !== 'linux')('a kept profile run whose fuller install recorded no launch path, while this run needs one, writes <verdict>.profile/<for>.env and leaves the lane\'s file alone', () => {
+    const f = fixture();
+    const zip = zipBun(f, '1.4.4');
+    const first = run(f, ['--for', 'autoplan']);
+    expect(first.status, first.stdout + first.stderr).toBe(0);
+    const launchFile = first.stdout.match(/^GSTACK_LAUNCH_FILE: (.+)$/m)?.[1] ?? '';
+    expect(JSON.parse(fs.readFileSync(launchFile.replace(/\.env$/, '.json'), 'utf8')).launch_path).toBe('');
+    const before = fs.readFileSync(launchFile, 'utf8');
+    fs.rmSync(path.join(f.stub, 'bun'));
+    const ok = run(f, ['--for', 'review-voice'], { STUB_CURL_ZIP: zip });
+    expect(ok.stdout).toContain(`GSTACK_LAUNCH_PATH: ${store(f, '1.4.4')}`);
+    expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+    expect(ok.stdout).toContain('gstack-capy-install: kept the install verdict for=autoplan');
+    const own = path.join(launchFile.replace(/\.env$/, '.profile'), 'review-voice.env');
+    expect(ok.stdout).toContain(`GSTACK_LAUNCH_FILE: ${own}\n`);
+    expect(fs.readFileSync(own, 'utf8')).toContain(`PATH='${store(f, '1.4.4')}':`);
+    expect(fs.readFileSync(launchFile, 'utf8')).toBe(before);
+  });
+
+  // protects: everything above `set -u` in bin/gstack-capy-install is the shebang, a comment or blank,
+  // so header prose never runs as shell. fails_when: a header line loses its `#` (f75c448 ran
+  // `never <verdict>.launch.` as a command with redirections in the caller's directory).
+  test('the installer header runs nothing: every line before set -u is a comment or blank', () => {
+    const lines = fs.readFileSync(path.join(REPO, 'bin/gstack-capy-install'), 'utf8').split('\n');
+    const end = lines.findIndex(l => l.startsWith('set -u'));
+    expect(end).toBeGreaterThan(0);
+    expect(lines.slice(0, end).filter(l => l.trim() !== '' && !l.startsWith('#'))).toEqual([]);
   });
 
   // protects: when the launch file's temp file IS created and the final mv fails, write_launch_file
@@ -975,7 +1191,7 @@ describe.skipIf(process.platform !== 'linux')('gstack-capy-install: the per-dire
     const sourced = spawnSync('sh', ['-c', '. "$1" && . "$1" && printf "%s\\n" "$PATH" "$GSTACK_STATE_ROOT" "$GSTACK_EPHEMERAL" "$GSTACK_INSTALL_VERDICT"', '_', launchFile],
       { encoding: 'utf8', timeout: 30_000, env: { PATH: '/usr/bin:/bin' } });
     expect(sourced.status, sourced.stderr).toBe(0);
-    expect(sourced.stdout.trimEnd().split('\n')).toEqual([`${state}/runtimes/bun/${BUN_DEFAULT}:/usr/bin:/bin`, state, '0', launchFile.replace(/\.env$/, '.json')]);
+    expect(sourced.stdout.trimEnd().split('\n')).toEqual([`${state}/runtimes/bun/${BUN_DEFAULT}:/usr/bin:/bin:${f.root}/bin`, state, '0', launchFile.replace(/\.env$/, '.json')]);
     const r = fresh(f, f.base, 'bun --version && bunx --version', { GSTACK_BUN_SHIM_EXPLAIN: '1' });
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout.trim().split('\n')[0]).toBe(BUN_DEFAULT);

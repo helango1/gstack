@@ -13,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { checkReceiptProse, proseLine, receiptCounters } from '../lib/ship-receipt-prose';
 import { renderReceiptBlock } from '../lib/ship-receipt';
 import { EXIT } from '../lib/headless-artifacts';
+import { renderRecord, type ApprovalRow, type StoreLocation } from '../lib/approval-record';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const BIN = path.join(ROOT, 'bin/gstack-ship-receipt');
@@ -69,6 +70,126 @@ describe('checkReceiptProse', () => {
     expect(checkReceiptProse(loop, 'REVIEW_LOOP: passes: 2 blocking_found: 1 deferred: 0 noted: 4 fixed: 8')).toEqual({ checked: 5, mismatches: [] });
     expect(checkReceiptProse(loop, 'Gate passed: 41 failed: 0')).toEqual({ checked: 2, mismatches: [] });
     expect(checkReceiptProse(loop, 'Review: 2 passes; passes = 2 fixed = 8.')).toEqual({ checked: 3, mismatches: [] });
+  });
+});
+
+// GST-412: the `## Approvals` block gstack-approvals renders quotes the owner's words, which can hold
+// numbers (`one Step 11 pass` read as a gate `pass` claim of 11). Only that rendered block is skipped.
+describe('the rendered Approvals block is not prose', () => {
+  const lanes = { ...receipt, gate: { unit: { pass: 1181, fail: 0, skip: 3 } } };
+  const row = (words: string): ApprovalRow => ({
+    schema_version: 1, id: 'a1', date: '2026-10-30', ask: 'Ship it after the gate', words, by: 'garry', scope: 'PR B',
+    pending: 'none', outcome: 'approved', source: 'thread', branch: 'b', recorded_at: '2026-10-30T00:00:00Z',
+  } as ApprovalRow);
+  const loc = { file: '/nonexistent', branch: 'gsta195-evidence-prose', slug: 's', ephemeral: false } as StoreLocation;
+  const block = renderRecord({ rows: [row('do it, one Step 11 pass is enough')], state: 'present', restored: false }, loc);
+
+  test('a number inside the rendered table is not a claim; the same sentence outside the block still is', () => {
+    expect(block).toContain('one Step 11 pass');
+    const body = 'Unit lane: 1181 pass.\n\n' + block + '\n' + renderReceiptBlock(lanes);
+    expect(checkReceiptProse(lanes, body)).toEqual({ checked: 1, mismatches: [] });
+    const outside = checkReceiptProse(lanes, 'Garry said one Step 11 pass is enough.\n\n' + block);
+    expect(outside.mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+  });
+
+  test('text after the footer is checked, a fenced "## Approvals" example hides nothing, and CRLF bodies work', () => {
+    const after = checkReceiptProse(lanes, block + '\nFollow-up: one Step 11 pass again.\n');
+    expect(after.mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+    const fenced = '```md\n## Approvals\n\n| Date | Asked |\n```\n\nThe lane ran 11 pass.\n';
+    expect(checkReceiptProse(lanes, fenced).mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+    const fencedThenTable = '````md\n## Approvals\n```\nstill fenced\n```\n````\n\n7 pass\n\n' + block;
+    expect(checkReceiptProse(lanes, fencedThenTable).mismatches).toEqual([{ field: 'gate.unit.pass', prose: 7, receipt: 1181 }]);
+    const crlf = ('Unit lane: 1181 pass.\n\n' + block).replace(/\n/g, '\r\n');
+    expect(checkReceiptProse(lanes, crlf)).toEqual({ checked: 1, mismatches: [] });
+    expect(checkReceiptProse(lanes, crlf + 'Then 11 pass.\r\n').mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+  });
+
+  test('the skipped block still separates the text around it, and a row the renderer would not write keeps the block in the check', () => {
+    expect(checkReceiptProse(receipt, 'Shipped in step 3\n\n' + block + '\nDeferred items are listed below.\n')).toEqual({ checked: 0, mismatches: [] });
+    const forged = block.replace(/(\|---\|[^\n]*\n)/, '$1| passes=9 deferred: 7 |\n');
+    expect(checkReceiptProse(receipt, forged).mismatches).toEqual([{ field: 'review_loop.passes', prose: 9, receipt: 2 }, { field: 'review_loop.deferred', prose: 7, receipt: 1 }]);
+  });
+
+  test('a heading that is not followed by the rendered table and footer is ordinary prose', () => {
+    const handWritten = '## Approvals\n\n- Garry: one Step 11 pass is enough\n';
+    expect(checkReceiptProse(lanes, handWritten).mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+    const noFooter = block.replace(/Source: gstack-approvals record.*\n/, '');
+    expect(checkReceiptProse(lanes, noFooter).mismatches).toEqual([{ field: 'gate.unit.pass', prose: 11, receipt: 1181 }]);
+  });
+});
+
+describe('the Review-loop exception line (GST-977, gstack-evals #139)', () => {
+  const excepted = {
+    ...receipt,
+    review_loop: { ...receipt.review_loop, fix_checks: 1 },
+    gate: { status: 'green', run: '139', unit: { pass: 1181, skip: 70 } },
+    review_loop_exception: { accepted_by: 'Garry', date: '2026-11-01', via: 'GEVA-2', reason: 'outside 1 and 2 skip detector', fix_check: { head: 'b'.repeat(40), findings: 0 } },
+  };
+  const line = 'Review-loop exception: accepted by Garry 2026-11-01 via GEVA-2: outside 1 and 2 skip detector (fix-check at bbbbbbbbbbbb, 0 findings)';
+
+  // Value: protects=a body that carries the exception line write requires can also pass --check-prose; fails_when=the
+  //   owner's reason is read as counter claims ("2 skip" against 70); seam=lib/ship-receipt-prose.ts checkReceiptProse
+  test('the exact line the receipt\'s exception requires is not prose; the rest of the body still is', () => {
+    expect(checkReceiptProse(excepted, `${line}\n\nGate: 70 skip.\n`)).toEqual({ checked: 1, mismatches: [] });
+    expect(checkReceiptProse(excepted, `  ${line}\r\nGate: 69 skip.`).mismatches).toEqual([{ field: 'gate.unit.skip', prose: 69, receipt: 70 }]);
+  });
+
+  test('the same words anywhere else, or a line for a different exception, stay prose', () => {
+    const twoSkip = [{ field: 'gate.unit.skip', prose: 2, receipt: 70 }];
+    expect(checkReceiptProse(excepted, `Note: ${line}`).mismatches).toEqual(twoSkip);
+    expect(checkReceiptProse(excepted, line.replace('GEVA-2', 'GEVA-3')).mismatches).toEqual(twoSkip);
+    expect(checkReceiptProse({ ...excepted, review_loop_exception: undefined }, line).mismatches).toEqual(twoSkip);
+  });
+});
+
+describe('the Documentation exception line (GST-983)', () => {
+  const excepted = {
+    ...receipt,
+    gate: { status: 'green', run: '983', unit: { pass: 1181, skip: 70 } },
+    docs: { status: 'blocked', scope: 'docs/', exception: { accepted_by: 'Garry', date: '2026-11-02', via: 'GSTA-36', reason: 'sections 1 and 2 skip the audit' } },
+  };
+  const line = 'Documentation exception: accepted by Garry 2026-11-02 via GSTA-36: sections 1 and 2 skip the audit';
+
+  // Value: protects=a body that carries the docs exception line write requires can also pass --check-prose; fails_when=the
+  //   owner's reason is read as counter claims ("2 skip" against 70); seam=lib/ship-receipt-prose.ts checkReceiptProse
+  test('the exact line the receipt\'s docs exception requires is not prose; the rest of the body still is', () => {
+    expect(checkReceiptProse(excepted, `## Documentation\n\n${line}\n\nGate: 70 skip.\n`)).toEqual({ checked: 1, mismatches: [] });
+    expect(checkReceiptProse(excepted, `  ${line}\r\nGate: 69 skip.`).mismatches).toEqual([{ field: 'gate.unit.skip', prose: 69, receipt: 70 }]);
+  });
+
+  test('the same words anywhere else, a line for a different exception, or a receipt with no exception stay prose', () => {
+    const twoSkip = [{ field: 'gate.unit.skip', prose: 2, receipt: 70 }];
+    expect(checkReceiptProse(excepted, `Note: ${line}`).mismatches).toEqual(twoSkip);
+    expect(checkReceiptProse(excepted, line.replace('GSTA-36', 'GSTA-37')).mismatches).toEqual(twoSkip);
+    expect(checkReceiptProse({ ...excepted, docs: { status: 'current', scope: 'docs/' } }, line).mismatches).toEqual(twoSkip);
+  });
+});
+
+describe('code fences are not prose (GST-984, gstack-evals #142)', () => {
+  const lanes = { ...receipt, gate: { status: 'green', run: '142', passed: 1181, failed: 0, unit: { pass: 1181, fail: 0 } } };
+  const evidence = '```text\n-  // one none trial per band task (the first 35 fail) and one told trial per pilot task.\nr3-drop, r3, r3-sol: 113 passed, 0 failed with the real list\nunit: 113 pass, 0 fail\n```\n';
+
+  // Value: protects=pasted test output and quoted code in a fence never count as this PR's counters; fails_when=the
+  //   fenced "113 passed" or "35 fail" is read against the receipt; seam=lib/ship-receipt-prose.ts checkReceiptProse
+  test('numbers inside a closed fence are skipped; counts outside it are still checked', () => {
+    expect(checkReceiptProse(lanes, `Gate: 1181 passed.\n\n${evidence}\nUnit: 1181 pass.\n`)).toEqual({ checked: 2, mismatches: [] });
+    expect(checkReceiptProse(lanes, `${evidence}\nUnit: 113 pass.\n`).mismatches).toEqual([{ field: 'gate.unit.pass', prose: 113, receipt: 1181 }]);
+    expect(checkReceiptProse(lanes, evidence.replace(/```/g, '~~~~').replace(/~~~~\n$/, '~~~~~\n'))).toEqual({ checked: 0, mismatches: [] });
+  });
+
+  test('a fence closes only on its own run, an unclosed fence stays prose, and the fence still separates the text around it', () => {
+    const short = '````\n113 pass\n```\nstill fenced 113 pass\n````\n';
+    expect(checkReceiptProse(lanes, short)).toEqual({ checked: 0, mismatches: [] });
+    expect(checkReceiptProse(lanes, 'Intro\n```text\n113 pass\n').mismatches).toEqual([{ field: 'gate.unit.pass', prose: 113, receipt: 1181 }]);
+    expect(checkReceiptProse(lanes, 'Shipped 3\n```\nx\n```\npass rates are below.\n')).toEqual({ checked: 0, mismatches: [] });
+  });
+
+  // Value: protects=a line that only looks like a fence opener, or a shorter fence inside an unclosed one, cannot hide a
+  //   claim GitHub shows as prose; fails_when=either shape skips the "113 pass" after it; seam=lib/ship-receipt-prose.ts checkReceiptProse
+  test('inline triple backticks open no fence, and nothing after an unclosed fence is skipped', () => {
+    const wrong = [{ field: 'gate.unit.pass', prose: 113, receipt: 1181 }];
+    expect(checkReceiptProse(lanes, '```npm test``` ran.\nUnit: 113 pass.\n\n```text\nlog\n```\n').mismatches).toEqual(wrong);
+    expect(checkReceiptProse(lanes, '````\n```\nUnit: 113 pass.\n```\n').mismatches).toEqual(wrong);
   });
 });
 
