@@ -154,4 +154,53 @@ describe('ubi-runner run, verify and quota against a fake API and a fake ssh', (
       expect(f.calls()).not.toContain('"create"');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 60_000);
+
+  // Value: protects=the run key and the VM tree check cover a tracked file that .gitignore matches when the checkout's index is split or missing; fails_when=the tree fingerprint starts from an empty index whenever it cannot copy the checkout's index; why_new=every other run-key test has a plain index and no tracked ignored file; seam=PATH (fake API and ssh); no_claim=a force-added ignored file that HEAD lacks while the index is split
+  test('run: with a split or missing index the run key still covers a tracked file that .gitignore matches, and the VM tree check agrees', () => {
+    const f = fakeVm();
+    try {
+      const repo = gitSrc(f);
+      const git = (...args: string[]) => {
+        const r = Bun.spawnSync(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: repo, timeout: 30_000 });
+        if (r.exitCode !== 0) throw new Error('git ' + args.join(' ') + ': ' + r.stderr.toString());
+      };
+      writeFileSync(join(repo, '.gitignore'), '*.log\n');
+      writeFileSync(join(repo, 'keep.log'), 'one\n');
+      git('add', '.gitignore'); git('add', '-f', 'keep.log'); git('commit', '-qm', 'tracked ignored file');
+      const key = () => {
+        const r = f.run(['run', '--probe', '--src', repo, '--', 'make test']);
+        const out = r.stdout.toString() + r.stderr.toString();
+        const m = /^UBI_ATTACH_INFO: none key=([0-9a-f]{12})$/m.exec(out);
+        if (!m) throw new Error(out);
+        return m[1]!;
+      };
+      const base = key();
+      const seen: Record<string, { same: boolean; edited: boolean }> = {};
+      const probe = (what: string) => {
+        const before = key();
+        writeFileSync(join(repo, 'keep.log'), 'two\n');
+        const same = before === base, edited = key() !== before;
+        writeFileSync(join(repo, 'keep.log'), 'one\n');
+        seen[what] = { same, edited };
+      };
+      probe('plain index');
+      git('config', 'core.splitIndex', 'true'); git('update-index', '--split-index');
+      probe('core.splitIndex=true');
+      // The split index's run reaches the VM, which gets no index, and the VM's tree matches this side's.
+      writeFileSync(join(f.root, 'command-mode'), 'cat keep.log');
+      const r = f.run(['run', '--src', repo, '--', 'make test']);
+      const err = r.stderr.toString();
+      expect(r.exitCode, err).toBe(0);
+      expect(err).not.toContain('UBI_VM_TREE_MISMATCH');
+      expect(r.stdout.toString()).toContain('one\n');
+      git('config', '--unset', 'core.splitIndex'); git('update-index', '--no-split-index');
+      rmSync(join(repo, '.git/index'));
+      probe('no index file');
+      expect(seen).toEqual({
+        'plain index': { same: true, edited: true },
+        'core.splitIndex=true': { same: true, edited: true },
+        'no index file': { same: true, edited: true },
+      });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 90_000);
 });

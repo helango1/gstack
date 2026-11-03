@@ -337,15 +337,20 @@ sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -
 # TREE_SH: print the content tree of the current directory, the same way here
 # and on the VM: at a checkout's root, `git add -A` into a copy of its index
 # (tracked plus untracked files that are not ignored, the files pack uploads);
+# a split index (whose shared half pack does not ship) or a missing one is read
+# from HEAD instead, so a tracked file that .gitignore matches stays in the tree;
 # elsewhere, the same into a scratch repository over the directory.
 TREE_SH='idx=$(mktemp -d "${TMPDIR:-/tmp}/ubirun-tree.XXXXXX") || exit 1
+seed=
 if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
   gi=$(git rev-parse --git-path index)
-  if [ "$(git config --bool core.splitIndex)" != true ] && [ -f "$gi" ]; then cp "$gi" "$idx/index"; fi
+  if [ "$(git config --bool core.splitIndex)" != true ] && [ -f "$gi" ]; then cp "$gi" "$idx/index"
+  else seed=$(git rev-parse -q --verify "HEAD^{tree}"); fi
 else
   git init -q --bare "$idx/git" && export GIT_DIR="$idx/git" GIT_WORK_TREE=.
 fi
-GIT_INDEX_FILE="$idx/index" git add -A >/dev/null 2>&1 && GIT_INDEX_FILE="$idx/index" git write-tree
+{ [ -z "$seed" ] || GIT_INDEX_FILE="$idx/index" git read-tree "$seed"; } \
+  && GIT_INDEX_FILE="$idx/index" git add -A >/dev/null 2>&1 && GIT_INDEX_FILE="$idx/index" git write-tree
 rc=$?; rm -rf "$idx"; exit $rc'
 
 # vm_tree NAME QDEST: the content tree of QDEST on the VM.
