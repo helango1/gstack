@@ -337,20 +337,21 @@ sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -
 # TREE_SH: print the content tree of the current directory, the same way here
 # and on the VM: at a checkout's root, `git add -A` into a copy of its index
 # (tracked plus untracked files that are not ignored, the files pack uploads);
-# a split index (whose shared half pack does not ship) or a missing one is read
-# from HEAD instead, so a tracked file that .gitignore matches stays in the tree;
-# elsewhere, the same into a scratch repository over the directory.
+# the copy is read and written unsplit, and pack ships it unsplit, so a split
+# index gives the same tree on both sides. A missing index (pack refuses that
+# checkout, so only the run key) is read from HEAD, so a tracked file that
+# .gitignore matches stays in the tree; elsewhere, the same into a scratch
+# repository over the directory.
 TREE_SH='idx=$(mktemp -d "${TMPDIR:-/tmp}/ubirun-tree.XXXXXX") || exit 1
 seed=
 if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
   gi=$(git rev-parse --git-path index)
-  if [ "$(git config --bool core.splitIndex)" != true ] && [ -f "$gi" ]; then cp "$gi" "$idx/index"
-  else seed=$(git rev-parse -q --verify "HEAD^{tree}"); fi
+  if [ -f "$gi" ]; then cp "$gi" "$idx/index"; else seed=$(git rev-parse -q --verify "HEAD^{tree}"); fi
 else
   git init -q --bare "$idx/git" && export GIT_DIR="$idx/git" GIT_WORK_TREE=.
 fi
-{ [ -z "$seed" ] || GIT_INDEX_FILE="$idx/index" git read-tree "$seed"; } \
-  && GIT_INDEX_FILE="$idx/index" git add -A >/dev/null 2>&1 && GIT_INDEX_FILE="$idx/index" git write-tree
+ig() { GIT_INDEX_FILE="$idx/index" git -c core.splitIndex=false "$@"; }
+{ [ -z "$seed" ] || ig read-tree "$seed"; } && ig add -A >/dev/null 2>&1 && ig write-tree
 rc=$?; rm -rf "$idx"; exit $rc'
 
 # vm_tree NAME QDEST: the content tree of QDEST on the VM.
@@ -1143,23 +1144,23 @@ cmd_pack() {
       case $entry in *$'\n'*) ;; *) entry="$entry"$'\n'true ;; esac
       git -C "$tmp/.git" config --add "${entry%%$'\n'*}" "${entry#*$'\n'}"
     done < <(git -C "$gitdir" config --local --null --get-regexp '^(remote|branch)\.' 2>/dev/null || true)
-    # The checkout's index rides along so the VM's status matches, except a
-    # split index, whose shared half lives only in the original git dir. The
-    # index's blobs that HEAD's tree lacks (staged, intent-to-add, the stages
+    # The checkout's index rides along so the VM's status matches; a split
+    # index's shared half lives only in the original git dir, so the copy is
+    # unsplit (read through $src's git dir) before it ships. The index's blobs that HEAD's tree lacks (staged, intent-to-add, the stages
     # of an unmerged entry) are behind no ref, so they travel as a pack of
     # their own; without them the VM's write-tree (gstack-wtree) cannot read a
     # staged file. cat, not cp: git renames index.lock over the index, which
     # cp reports as "replaced while being copied"; one open() reads one whole index.
-    if [ "$(git -C "$src" config --bool core.splitIndex 2>/dev/null)" != true ]; then
-      cat "$(cd "$src" && cd "$(dirname "$(git rev-parse --git-path index)")" && pwd)/index" > "$tmp/.git/index"
-      # Read the copy, not the live index, so the pack matches it; a gitlink's
-      # sha (mode 160000) is a submodule commit this object store lacks.
-      GIT_INDEX_FILE="$tmp/.git/index" git -C "$src" ls-files -s | awk '$1 != "160000" {print $2}' | sort -u \
-        | comm -23 - <(git -C "$src" ls-tree -r HEAD | awk '{print $3}' | sort -u) \
-        | git -C "$src" pack-objects -q --stdout \
-        | git -C "$tmp/.git" unpack-objects -q \
-        || die "pack: could not snapshot the staged blobs of $src"
-    fi
+    cat "$(cd "$src" && cd "$(dirname "$(git rev-parse --git-path index)")" && pwd)/index" > "$tmp/.git/index"
+    GIT_INDEX_FILE="$tmp/.git/index" git -C "$src" -c core.splitIndex=false update-index --no-split-index \
+      || die "pack: could not unsplit the index copy of $src"
+    # Read the copy, not the live index, so the pack matches it; a gitlink's
+    # sha (mode 160000) is a submodule commit this object store lacks.
+    GIT_INDEX_FILE="$tmp/.git/index" git -C "$src" ls-files -s | awk '$1 != "160000" {print $2}' | sort -u \
+      | comm -23 - <(git -C "$src" ls-tree -r HEAD | awk '{print $3}' | sort -u) \
+      | git -C "$src" pack-objects -q --stdout \
+      | git -C "$tmp/.git" unpack-objects -q \
+      || die "pack: could not snapshot the staged blobs of $src"
     (
       cd "$src"
       export COPYFILE_DISABLE=1

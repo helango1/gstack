@@ -155,7 +155,7 @@ describe('ubi-runner run, verify and quota against a fake API and a fake ssh', (
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 60_000);
 
-  // Value: protects=the run key and the VM tree check cover a tracked file that .gitignore matches when the checkout's index is split or missing; fails_when=the tree fingerprint starts from an empty index whenever it cannot copy the checkout's index; why_new=every other run-key test has a plain index and no tracked ignored file; seam=PATH (fake API and ssh); no_claim=a force-added ignored file that HEAD lacks while the index is split
+  // Value: protects=the run key and the VM tree check cover a tracked file that .gitignore matches when the checkout's index is split or missing, and a split index's run reaches the VM with a matching tree; fails_when=the tree fingerprint starts from an empty or HEAD-seeded index instead of the checkout's split index, or pack ships a split index or none; why_new=every other run-key test has a plain index and no tracked ignored file; seam=none (the fixture's fake API and ssh are already first on PATH); no_claim=a VM run from a checkout with no index file, which pack refuses
   test('run: with a split or missing index the run key still covers a tracked file that .gitignore matches, and the VM tree check agrees', () => {
     const f = fakeVm();
     try {
@@ -186,14 +186,22 @@ describe('ubi-runner run, verify and quota against a fake API and a fake ssh', (
       probe('plain index');
       git('config', 'core.splitIndex', 'true'); git('update-index', '--split-index');
       probe('core.splitIndex=true');
-      // The split index's run reaches the VM, which gets no index, and the VM's tree matches this side's.
-      writeFileSync(join(f.root, 'command-mode'), 'cat keep.log');
-      const r = f.run(['run', '--src', repo, '--', 'make test']);
-      const err = r.stderr.toString();
-      expect(r.exitCode, err).toBe(0);
-      expect(err).not.toContain('UBI_VM_TREE_MISMATCH');
-      expect(r.stdout.toString()).toContain('one\n');
-      git('config', '--unset', 'core.splitIndex'); git('update-index', '--no-split-index');
+      // A split index's run reaches the VM with the index unsplit, and the VM's tree matches this side's:
+      // with the file tracked, untracked in the index only, and with the split but no core.splitIndex.
+      writeFileSync(join(f.root, 'command-mode'), 'cat keep.log 2>/dev/null || echo no keep.log');
+      const vmRun = (what: string) => {
+        const r = f.run(['run', '--src', repo, '--', 'make test']);
+        const err = r.stderr.toString();
+        expect({ what, rc: r.exitCode, mismatch: err.includes('UBI_VM_TREE_MISMATCH') }, err).toEqual({ what, rc: 0, mismatch: false });
+        return r.stdout.toString();
+      };
+      expect(vmRun('split')).toContain('one\n');
+      // New content, so the keep.log the fake VM kept from the run before cannot stand in for this one.
+      git('rm', '-q', '--cached', 'keep.log'); writeFileSync(join(repo, 'keep.log'), 'three\n');
+      vmRun('split, rm --cached');
+      writeFileSync(join(repo, 'keep.log'), 'one\n'); git('add', '-f', 'keep.log'); git('config', '--unset', 'core.splitIndex');
+      vmRun('split, no core.splitIndex');
+      git('update-index', '--no-split-index');
       rmSync(join(repo, '.git/index'));
       probe('no index file');
       expect(seen).toEqual({
