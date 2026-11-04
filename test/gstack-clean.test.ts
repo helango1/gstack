@@ -157,8 +157,9 @@ describe('gstack-clean', () => {
     expect(lines[0]).toBe('gstack-clean: target ' + f.gs + ' (the .gstack folder at the git toplevel ' + f.repo + ')');
     expect(r.out).toMatch(/would remove +tmp\/codex-err-old1 \(10 bytes\)/);
     expect(r.out).toMatch(/would cut +browse-console\.log \(freeing \d+ bytes\)/);
+    expect(r.out).toMatch(/would remove +browse-daemon\.log\.1 \(\d+ bytes\): rotated browse daemon log/);
     expect(r.out).toMatch(/skip +tmp\/codex-dir: is not a regular file/);
-    expect(r.out).toMatch(/^total: 3 actions would free \d+ bytes; 1 skipped$/m);
+    expect(r.out).toMatch(/^total: 4 actions would free \d+ bytes; 1 skipped$/m);
     expect(lines.at(-1)).toBe('nothing changed; to do this: gstack-clean --apply');
   });
 
@@ -172,13 +173,15 @@ describe('gstack-clean', () => {
     const after = snapshot(f.root);
     expect(changedKeys(before, after)).toEqual([
       'repo/.gstack/browse-console.log',
+      'repo/.gstack/browse-daemon.log.1',
       'repo/.gstack/tmp/codex-err-old1',
       'repo/.gstack/tmp/codex-resp-old2',
     ]);
     expect(after['repo/.gstack/tmp/codex-err-old1']).toBeUndefined();
+    expect(after['repo/.gstack/browse-daemon.log.1']).toBeUndefined();
     expect(after['repo/.gstack/browse-console.log']).toBeDefined();
     expect(r.out).toMatch(/^removed +tmp\/codex-resp-old2 \(12 bytes\)/m);
-    expect(r.out).toMatch(/^total: 3 actions freed \d+ bytes; 1 skipped$/m);
+    expect(r.out).toMatch(/^total: 4 actions freed \d+ bytes; 1 skipped$/m);
     expect(r.out).not.toContain('nothing changed');
   });
 
@@ -348,6 +351,62 @@ describe('gstack-clean', () => {
     });
   });
 
+  describe('the rotated daemon log browse-daemon.log.1', () => {
+    const rotated = (f: Fixture, ageMs = 2 * 60 * 60 * 1000) => put(path.join(f.gs, 'browse-daemon.log.1'), logText(64 * 1024), ageMs);
+
+    test('an hour old with no daemon: the dry run names it, apply removes it and nothing else', () => {
+      const f = fixture();
+      const size = fs.statSync(rotated(f)).size;
+      put(path.join(f.gs, 'browse-daemon.log'), logText(4 * 1024), 2 * 60 * 60 * 1000);
+      for (const name of ['browse-daemon.log.2', 'browse-console.log.1', 'browse-daemon.log.1.bak', 'tmp/browse-daemon.log.1', 'browse-states/browse-daemon.log.1'])
+        put(path.join(f.gs, name), 'not the rotated log', 400 * DAY);
+      put(path.join(f.repo, 'browse-daemon.log.1'), 'outside .gstack', 400 * DAY);
+      const before = snapshot(f.root);
+      const dry = run(f, []);
+      expect(dry.code).toBe(0);
+      expect(dry.out).toContain('would remove browse-daemon.log.1 (' + size + ' bytes): rotated browse daemon log');
+      expect(dry.out).toMatch(/^total: 1 action would free \d+ bytes; 0 skipped$/m);
+      expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+      const r = run(f, ['--apply']);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('removed      browse-daemon.log.1 (' + size + ' bytes): rotated browse daemon log');
+      expect(changedKeys(before, snapshot(f.root))).toEqual(['repo/.gstack/browse-daemon.log.1']);
+    });
+
+    test('a live daemon keeps it', () => {
+      const f = fixture();
+      rotated(f);
+      put(path.join(f.gs, 'browse.json'), JSON.stringify({ pid: process.pid, port: 1 }));
+      const before = snapshot(f.root);
+      const r = run(f, ['--apply']);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('skip         browse-daemon.log.1: the browse daemon (pid ' + process.pid + ', browse.json) is running');
+      expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+    });
+
+    test('one modified within the last hour is kept', () => {
+      const f = fixture();
+      rotated(f, 10 * 60 * 1000);
+      const before = snapshot(f.root);
+      const r = run(f, ['--apply']);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('skip         browse-daemon.log.1: modified within the last hour');
+      expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+    });
+
+    test('a symlink by that name is left alone, and so is its target', () => {
+      const f = fixture();
+      const outside = put(path.join(f.root, 'outside', 'precious.log'), 'precious', 400 * DAY);
+      fs.symlinkSync(outside, path.join(f.gs, 'browse-daemon.log.1'));
+      const before = snapshot(f.root);
+      const r = run(f, ['--apply']);
+      expect(r.code).toBe(0);
+      expect(r.out).toMatch(/skip +browse-daemon\.log\.1: is a symlink/);
+      expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+      expect(fs.readFileSync(outside, 'utf8')).toBe('precious');
+    });
+  });
+
   test('the in-place cut keeps the inode and starts on a line boundary', () => {
     const f = fixture();
     const text = logText(1.5 * 1024 * 1024);
@@ -510,7 +569,7 @@ describe('gstack-clean', () => {
       const f = fixture();
       const r = run(f, ['--help']);
       expect(r.code).toBe(0);
-      for (const needle of ['older than 7 days', 'over 1 MB', 'last 256 KB', '--audit-days N', 'in the last hour']) expect(r.out).toContain(needle);
+      for (const needle of ['older than 7 days', 'over 1 MB', 'last 256 KB', 'browse-daemon.log.1', '--audit-days N', 'in the last hour']) expect(r.out).toContain(needle);
     });
   });
 
@@ -526,12 +585,13 @@ describe('gstack-clean', () => {
       ['tmp/codex-err-old1', 'tmp', 'remove', 'planned'],
       ['tmp/codex-resp-old2', 'tmp', 'remove', 'planned'],
       ['browse-console.log', 'browse', 'cut', 'planned'],
+      ['browse-daemon.log.1', 'browse', 'remove', 'planned'],
     ]);
     expect(plan.skips).toEqual([{ path: path.join(f.gs, 'tmp', 'codex-dir'), rel: 'tmp/codex-dir', group: 'tmp', reason: 'is not a regular file; left alone' }]);
-    expect(plan.total).toEqual({ actions: 3, bytes: plan.actions.reduce((n: number, a: any) => n + a.bytes, 0), failed: 0, skipped: 1 });
+    expect(plan.total).toEqual({ actions: 4, bytes: plan.actions.reduce((n: number, a: any) => n + a.bytes, 0), failed: 0, skipped: 1 });
     const applied = JSON.parse(run(f, ['--json', '--apply']).out);
     expect(applied).toMatchObject({ mode: 'apply', status: 'done', exit_code: 0 });
-    expect(applied.actions.map((a: any) => a.status)).toEqual(['done', 'done', 'done']);
+    expect(applied.actions.map((a: any) => a.status)).toEqual(['done', 'done', 'done', 'done']);
     expect(JSON.parse(run(f, ['--json']).out)).toMatchObject({ status: 'nothing_to_do', actions: [] });
     const refused = run(f, ['--json'], { cwd: f.root });
     expect(refused.code).toBe(3);

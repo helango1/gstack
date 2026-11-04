@@ -6,6 +6,8 @@
  *   tmp/codex-*            top-level regular files older than 7 days
  *   browse-*.log           over 1 MB, cut in place to the last 256 KB from a
  *                          line start (same inode, so O_APPEND writers go on)
+ *   browse-daemon.log.1    the browse CLI's rotated daemon log, removed (no
+ *                          writer has it open; the next rotation replaces it)
  *   browse-audit.jsonl     only with --audit-days N: entries older than N days
  *
  * browse.json, session-state.json, chromium-profile/, browser-skills/,
@@ -31,6 +33,8 @@ const LIVENESS_RECHECK_MS = 2000;
 export const LOG_CUT_OVER_BYTES = 1024 * 1024;
 export const LOG_KEEP_BYTES = 256 * 1024;
 export const BROWSE_LOGS = ['browse-console.log', 'browse-network.log', 'browse-dialog.log', 'browse-daemon.log', 'browse-startup-error.log'] as const;
+/** rotateDaemonLogIfOversized (browse/src/cli.ts) renames browse-daemon.log to this past 10 MB, one generation. */
+export const ROTATED_DAEMON_LOG = 'browse-daemon.log.1';
 export const AUDIT_LOG = 'browse-audit.jsonl';
 export const USAGE = 'usage: gstack-clean [--apply] [--audit-days N] [--json]';
 
@@ -49,6 +53,7 @@ What it cleans (fixed thresholds):
   browse-daemon.log, browse-startup-error.log
                         over 1 MB: cut in place to the last 256 KB,
                         starting after a line break
+  browse-daemon.log.1   the rotated daemon log: removed
   browse-audit.jsonl    only with --audit-days N: entries older than N days
                         removed; lines without a readable ts are kept
 
@@ -208,12 +213,12 @@ function evaluate(c: Candidate, dir: string, busy: string | null, opts: CleanOpt
     return e?.code === 'ENOENT' ? null : { ...c, reason: `cannot resolve (${e?.code ?? 'error'})` };
   }
   if (path.dirname(real) !== dir) return { ...c, reason: 'resolves outside the folder being cleaned; left alone' };
-  if (c.kind === 'remove' && now - st.mtimeMs < SCRATCH_MIN_AGE_MS) return null;
+  if (c.kind === 'remove' && c.group === 'tmp' && now - st.mtimeMs < SCRATCH_MIN_AGE_MS) return null;
   if (c.kind === 'cut' && st.size <= LOG_CUT_OVER_BYTES) return null;
   if (now - st.mtimeMs < RECENT_MS) return { ...c, reason: 'modified within the last hour' };
   if (busy) return { ...c, reason: busy };
   const seen: Seen = { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs };
-  if (c.kind === 'remove') return { ...c, seen, bytes: st.size, reason: 'codex scratch older than 7 days' };
+  if (c.kind === 'remove') return { ...c, seen, bytes: st.size, reason: c.group === 'tmp' ? 'codex scratch older than 7 days' : 'rotated browse daemon log' };
   if (st.nlink !== 1) return { ...c, reason: `has ${st.nlink} hard links, so cutting it would change a file outside this folder; left alone` };
   let content: Buffer;
   try { content = c.kind === 'cut' ? readTail(c.file, st.size) : fs.readFileSync(c.file); } catch (e: any) {
@@ -253,6 +258,7 @@ function candidates(target: string, opts: CleanOptions): { list: Candidate[]; sk
     for (const name of names) if (name.startsWith(SCRATCH_PREFIX)) list.push({ file: path.join(tmp, name), group: 'tmp', kind: 'remove' });
   }
   for (const name of BROWSE_LOGS) list.push({ file: path.join(target, name), group: 'browse', kind: 'cut' });
+  list.push({ file: path.join(target, ROTATED_DAEMON_LOG), group: 'browse', kind: 'remove' });
   if (opts.auditDays !== null) list.push({ file: path.join(target, AUDIT_LOG), group: 'browse', kind: 'rotate' });
   return { list, skips };
 }
