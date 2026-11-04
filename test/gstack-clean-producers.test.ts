@@ -1,6 +1,6 @@
 /**
- * gstack-clean removes only top-level tmp/codex-* files in a repository's
- * .gstack (lib/repo-state-clean.ts, #2627 D8). This test greps the tracked
+ * In a repository's .gstack/tmp/, gstack-clean removes only top-level
+ * codex-* files (lib/repo-state-clean.ts, #2627 D8). This test greps the tracked
  * templates, lib, bin and scripts for every producer of a .gstack/tmp/ entry
  * and fails when one is not classified below, as scratch gstack-clean may
  * remove or as kept, or when a codex-* name is not on the scratch list (a kept
