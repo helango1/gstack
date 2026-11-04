@@ -384,6 +384,18 @@ describe('gstack-clean', () => {
       expect(changedKeys(before, snapshot(f.root))).toEqual([]);
     });
 
+    test('the dry run with a live daemon does not list it', () => {
+      const f = fixture();
+      rotated(f);
+      put(path.join(f.gs, 'browse.json'), JSON.stringify({ pid: process.pid, port: 1 }));
+      const before = snapshot(f.root);
+      const r = run(f, []);
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain('would remove browse-daemon.log.1');
+      expect(r.out).toContain('skip         browse-daemon.log.1: the browse daemon (pid ' + process.pid + ', browse.json) is running');
+      expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+    });
+
     test('one modified within the last hour is kept', () => {
       const f = fixture();
       rotated(f, 10 * 60 * 1000);
@@ -404,6 +416,22 @@ describe('gstack-clean', () => {
       expect(r.out).toMatch(/skip +browse-daemon\.log\.1: is a symlink/);
       expect(changedKeys(before, snapshot(f.root))).toEqual([]);
       expect(fs.readFileSync(outside, 'utf8')).toBe('precious');
+    });
+
+    test('a directory by that name is left alone, in the dry run and with --apply', () => {
+      const f = fixture();
+      const dir = path.join(f.gs, 'browse-daemon.log.1');
+      put(path.join(dir, 'inner.log'), logText(4 * 1024), 400 * DAY);
+      const old = new Date(Date.now() - 400 * DAY);
+      fs.utimesSync(dir, old, old);
+      const before = snapshot(f.root);
+      for (const args of [[], ['--apply']]) {
+        const r = run(f, args);
+        expect(r.code).toBe(0);
+        expect(r.out).not.toMatch(/(would remove|removed) +browse-daemon\.log\.1/);
+        expect(r.out).toContain('skip         browse-daemon.log.1: is not a regular file; left alone');
+        expect(changedKeys(before, snapshot(f.root))).toEqual([]);
+      }
     });
   });
 
