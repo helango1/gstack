@@ -6,8 +6,9 @@
  *   tmp/codex-*            top-level regular files older than 7 days
  *   browse-*.log           over 1 MB, cut in place to the last 256 KB from a
  *                          line start (same inode, so O_APPEND writers go on)
- *   browse-daemon.log.1    the browse CLI's rotated daemon log, removed (no
- *                          writer has it open; the next rotation replaces it)
+ *   browse-daemon.log.1    the browse CLI's rotated daemon log, removed once
+ *                          it has not changed for an hour and no browse
+ *                          daemon runs (the next rotation replaces it)
  *   browse-audit.jsonl     only with --audit-days N: entries older than N days
  *
  * browse.json, session-state.json, chromium-profile/, browser-skills/,
@@ -53,7 +54,8 @@ What it cleans (fixed thresholds):
   browse-daemon.log, browse-startup-error.log
                         over 1 MB: cut in place to the last 256 KB,
                         starting after a line break
-  browse-daemon.log.1   the rotated daemon log: removed
+  browse-daemon.log.1   the rotated daemon log: removed after an hour
+                        without change
   browse-audit.jsonl    only with --audit-days N: entries older than N days
                         removed; lines without a readable ts are kept
 
@@ -330,6 +332,11 @@ export function applyClean(target: string, planned: Action[], opts: CleanOptions
       if (!parentIntact(fresh.file, dirOf(fresh, target))) throw changed();
       if (fresh.kind === 'remove') {
         if (!same(fs.lstatSync(fresh.file), fresh.seen)) throw changed();
+        // A rename onto the name between this check and the unlink (the
+        // browse CLI rotating browse-daemon.log as a daemon starts) is
+        // removed unchecked. Accepted: the tmp removes have the same gap, and
+        // the loss is at most one old daemon log, which the next rotation
+        // would overwrite anyway.
         fs.unlinkSync(fresh.file);
       } else cutInPlace(fresh.file, fresh.keep!, fresh.seen);
       done.push({ action: fresh });
