@@ -6888,7 +6888,7 @@ These codes come from `scripts/ubicloud/ubi-runner.sh` (GST-1220). `RECOVERED`, 
 
 ## Per-repo cleanup (gstack-clean)
 
-These codes come from `bin/gstack-clean`, which reclaims old codex scratch in `<repo>/.gstack/tmp/`, browse logs over 1 MB and, with `--audit-days N`, old browse audit entries. It changes nothing unless you pass `--apply`, and `gstack-clean --help` lists what it touches.
+These codes come from `bin/gstack-clean`, which reclaims old codex scratch in `<repo>/.gstack/tmp/`, browse logs over 1 MB, the rotated `browse-daemon.log.1` and, with `--audit-days N`, old browse audit entries. It changes nothing unless you pass `--apply`, and `gstack-clean --help` lists what it touches.
 
 <a id="gstack-clean-usage"></a>
 ### `gstack-clean: an unknown flag or a bad --audit-days value … (GSTACK_CLEAN_USAGE)`
