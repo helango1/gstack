@@ -36,15 +36,25 @@ function run(env: Record<string, string | undefined>, cwd?: string): Record<stri
 }
 
 /**
- * Asserts the TMP_ROOT bash printed is the directory `want`. On POSIX the
- * strings must match exactly. Git Bash spells one directory several ways
- * (C:/x from git, /c/x from pwd, C:\\x from Node, 8.3 short names), so on
- * every platform bash also resolves both with `cd && pwd -P` and compares.
+ * True when bash sees both paths as one existing directory. `-ef` compares
+ * file identity, so Git Bash spellings of one directory (C:/x from git, /c/x
+ * from pwd, C:\\x from Node, 8.3 short names) still match, and a missing path
+ * never matches.
  */
+function sameDir(a: string, b: string): boolean {
+  const r = spawnSync('bash', ['-c', '[ -d "$1" ] && [ -d "$2" ] && [ "$1" -ef "$2" ]', 'sh', a, b], { timeout: 30_000 });
+  return r.status === 0;
+}
+
+/** Asserts the TMP_ROOT bash printed is the directory `want`; on POSIX the strings must also match exactly. */
 function expectSameDir(got: string, want: string): void {
   if (process.platform !== 'win32') expect(got).toBe(want);
-  const r = spawnSync('bash', ['-c', '[ "$(cd "$1" && pwd -P)" = "$(cd "$2" && pwd -P)" ]', 'sh', got, want], { timeout: 30_000 });
-  expect({ got, want, same: r.status === 0 }).toEqual({ got, want, same: true });
+  expect({ got, want, same: sameDir(got, want) }).toEqual({ got, want, same: true });
+}
+
+/** `git init` in dir with a scrubbed env, so an exported GIT_DIR or GIT_WORK_TREE cannot redirect it. */
+function gitInit(dir: string): void {
+  expect(spawnSync('git', ['init', '-q'], { cwd: dir, env: { PATH: process.env.PATH } as Record<string, string> }).status).toBe(0);
 }
 
 /** `gstack-paths --get TMP_ROOT` from cwd, the form skill bash blocks use. */
@@ -124,7 +134,7 @@ describe('gstack-paths', () => {
     expect(run({ TMP: '/tmp/y', HOME: '/h' }).TMP_ROOT).toBe('/tmp/y');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-tmp-'));
     try {
-      expect(spawnSync('git', ['init', '-q'], { cwd: dir }).status).toBe(0);
+      gitInit(dir);
       expectSameDir(run({ HOME: '' }, dir).TMP_ROOT, path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -137,7 +147,7 @@ describe('gstack-paths', () => {
   test('TMP_ROOT fallback from a subfolder lands at the git toplevel, and no subfolder .gstack is made', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-sub-'));
     try {
-      expect(spawnSync('git', ['init', '-q'], { cwd: dir }).status).toBe(0);
+      gitInit(dir);
       const sub = path.join(dir, 'pkg', 'sub');
       fs.mkdirSync(sub, { recursive: true });
       const want = path.join(fs.realpathSync(dir), '.gstack', 'tmp');
@@ -146,6 +156,19 @@ describe('gstack-paths', () => {
       expect(fs.existsSync(path.join(sub, '.gstack'))).toBe(false);
       expect(fs.existsSync(path.join(dir, 'pkg', '.gstack'))).toBe(false);
       expect(run({ HOME: '' }, sub).TMP_ROOT).toBe(getTmpRoot({ HOME: '' }, sub));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('sameDir rejects missing and different directories', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-same-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'a'));
+      fs.mkdirSync(path.join(dir, 'b'));
+      expect(sameDir(path.join(dir, 'a'), path.join(dir, 'a', '..', 'a'))).toBe(true);
+      expect(sameDir(path.join(dir, 'a'), path.join(dir, 'b'))).toBe(false);
+      expect(sameDir(path.join(dir, 'missing1'), path.join(dir, 'missing2'))).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
