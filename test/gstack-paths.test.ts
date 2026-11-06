@@ -35,6 +35,18 @@ function run(env: Record<string, string | undefined>, cwd?: string): Record<stri
   return out;
 }
 
+/**
+ * Asserts the TMP_ROOT bash printed is the directory `want`. On POSIX the
+ * strings must match exactly. Git Bash spells one directory several ways
+ * (C:/x from git, /c/x from pwd, C:\\x from Node, 8.3 short names), so on
+ * every platform bash also resolves both with `cd && pwd -P` and compares.
+ */
+function expectSameDir(got: string, want: string): void {
+  if (process.platform !== 'win32') expect(got).toBe(want);
+  const r = spawnSync('bash', ['-c', '[ "$(cd "$1" && pwd -P)" = "$(cd "$2" && pwd -P)" ]', 'sh', got, want], { timeout: 30_000 });
+  expect({ got, want, same: r.status === 0 }).toEqual({ got, want, same: true });
+}
+
 /** `gstack-paths --get TMP_ROOT` from cwd, the form skill bash blocks use. */
 function getTmpRoot(env: Record<string, string | undefined>, cwd: string): string {
   const r = spawnSync('bash', [BIN, '--get', 'TMP_ROOT'], {
@@ -113,7 +125,7 @@ describe('gstack-paths', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-tmp-'));
     try {
       expect(spawnSync('git', ['init', '-q'], { cwd: dir }).status).toBe(0);
-      expect(run({ HOME: '' }, dir).TMP_ROOT).toBe(path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
+      expectSameDir(run({ HOME: '' }, dir).TMP_ROOT, path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -129,7 +141,7 @@ describe('gstack-paths', () => {
       const sub = path.join(dir, 'pkg', 'sub');
       fs.mkdirSync(sub, { recursive: true });
       const want = path.join(fs.realpathSync(dir), '.gstack', 'tmp');
-      expect(run({ HOME: '' }, sub).TMP_ROOT).toBe(want);
+      expectSameDir(run({ HOME: '' }, sub).TMP_ROOT, want);
       expect(fs.statSync(want).isDirectory()).toBe(true);
       expect(fs.existsSync(path.join(sub, '.gstack'))).toBe(false);
       expect(fs.existsSync(path.join(dir, 'pkg', '.gstack'))).toBe(false);
@@ -145,7 +157,7 @@ describe('gstack-paths', () => {
       // GIT_CEILING_DIRECTORIES stops discovery at the temp root, so a repo
       // that happens to contain os.tmpdir() cannot capture this case.
       const env = { HOME: '', GIT_CEILING_DIRECTORIES: path.dirname(fs.realpathSync(dir)) };
-      expect(run(env, dir).TMP_ROOT).toBe(path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
+      expectSameDir(run(env, dir).TMP_ROOT, path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
       expect(fs.statSync(path.join(dir, '.gstack', 'tmp')).isDirectory()).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
