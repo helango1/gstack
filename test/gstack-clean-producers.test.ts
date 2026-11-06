@@ -17,7 +17,7 @@ const ROOT = path.resolve(import.meta.dir, '..');
 
 /** Throwaway names gstack-clean removes after 7 days; every one starts with SCRATCH_PREFIX. Exact names, so a new codex-* producer must be looked at. */
 const SCRATCH: Record<string, string> = {
-  'codex-err-XXXXXX': 'codex stderr capture under TMP_ROOT, which falls back to .gstack/tmp (codex/sections/*.md.tmpl)',
+  'codex-err-XXXXXX': 'codex stderr capture under TMP_ROOT, which falls back to <git toplevel>/.gstack/tmp (codex/sections/*.md.tmpl)',
   'codex-resp-XXXXXX': 'codex response capture under TMP_ROOT (codex/sections/*.md.tmpl)',
   'codex-out-XXXXXX': 'codex review output under TMP_ROOT (codex/sections/review-mode.md.tmpl)',
   'codex-prompt-XXXXXX': 'codex review prompt under TMP_ROOT (codex/sections/review-mode.md.tmpl)',
