@@ -17,9 +17,10 @@ const BIN = path.join(ROOT, 'bin', 'gstack-paths');
 // HOME from USERPROFILE at shell startup if HOME is unset/empty, which
 // silently breaks the "HOME unset" test scenarios. Clearing USERPROFILE
 // alongside HOME prevents that auto-population on Windows runners.
-function run(env: Record<string, string | undefined>): Record<string, string> {
+function run(env: Record<string, string | undefined>, cwd?: string): Record<string, string> {
   const result = spawnSync('bash', [BIN], {
     env: { PATH: process.env.PATH, USERPROFILE: '', ...env } as Record<string, string>,
+    cwd,
     encoding: 'utf-8',
     timeout: 30_000,
   });
@@ -32,6 +33,18 @@ function run(env: Record<string, string | undefined>): Record<string, string> {
     if (eq > 0) out[line.slice(0, eq)] = line.slice(eq + 1);
   }
   return out;
+}
+
+/** `gstack-paths --get TMP_ROOT` from cwd, the form skill bash blocks use. */
+function getTmpRoot(env: Record<string, string | undefined>, cwd: string): string {
+  const r = spawnSync('bash', [BIN, '--get', 'TMP_ROOT'], {
+    env: { PATH: process.env.PATH, USERPROFILE: '', ...env } as Record<string, string>,
+    cwd,
+    encoding: 'utf-8',
+    timeout: 30_000,
+  });
+  if (r.status !== 0) throw new Error(`gstack-paths --get failed (status ${r.status}): ${r.stderr}`);
+  return r.stdout.replace(/\n$/, '');
 }
 
 describe('gstack-paths', () => {
@@ -94,10 +107,49 @@ describe('gstack-paths', () => {
     }
   });
 
-  test('TMP_ROOT chain: TMPDIR > TMP > .gstack/tmp', () => {
+  test('TMP_ROOT chain: TMPDIR > TMP > <git toplevel>/.gstack/tmp', () => {
     expect(run({ TMPDIR: '/tmp/x', HOME: '/h' }).TMP_ROOT).toBe('/tmp/x');
     expect(run({ TMP: '/tmp/y', HOME: '/h' }).TMP_ROOT).toBe('/tmp/y');
-    expect(run({ HOME: '' }).TMP_ROOT).toBe('.gstack/tmp');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-tmp-'));
+    try {
+      expect(spawnSync('git', ['init', '-q'], { cwd: dir }).status).toBe(0);
+      expect(run({ HOME: '' }, dir).TMP_ROOT).toBe(path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // gstack-clean reclaims <git toplevel>/.gstack/tmp only. /codex scratch made
+  // from a subfolder with TMPDIR and TMP unset must land there, not in a
+  // <subfolder>/.gstack/tmp nothing cleans (TODOS.md, gstack-clean follow-ups).
+  test('TMP_ROOT fallback from a subfolder lands at the git toplevel, and no subfolder .gstack is made', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-sub-'));
+    try {
+      expect(spawnSync('git', ['init', '-q'], { cwd: dir }).status).toBe(0);
+      const sub = path.join(dir, 'pkg', 'sub');
+      fs.mkdirSync(sub, { recursive: true });
+      const want = path.join(fs.realpathSync(dir), '.gstack', 'tmp');
+      expect(run({ HOME: '' }, sub).TMP_ROOT).toBe(want);
+      expect(fs.statSync(want).isDirectory()).toBe(true);
+      expect(fs.existsSync(path.join(sub, '.gstack'))).toBe(false);
+      expect(fs.existsSync(path.join(dir, 'pkg', '.gstack'))).toBe(false);
+      expect(run({ HOME: '' }, sub).TMP_ROOT).toBe(getTmpRoot({ HOME: '' }, sub));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('TMP_ROOT fallback outside a git work tree is <cwd>/.gstack/tmp', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-nogit-'));
+    try {
+      // GIT_CEILING_DIRECTORIES stops discovery at the temp root, so a repo
+      // that happens to contain os.tmpdir() cannot capture this case.
+      const env = { HOME: '', GIT_CEILING_DIRECTORIES: path.dirname(fs.realpathSync(dir)) };
+      expect(run(env, dir).TMP_ROOT).toBe(path.join(fs.realpathSync(dir), '.gstack', 'tmp'));
+      expect(fs.statSync(path.join(dir, '.gstack', 'tmp')).isDirectory()).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('emits all three exports on every invocation', () => {

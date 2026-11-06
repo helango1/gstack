@@ -19,7 +19,8 @@
 #                      to relocate state; GSTACK_STATE_ROOT is this script's output,
 #                      also honored as input; GSTACK_STATE_DIR is a legacy alias)
 #   PLAN_ROOT:         GSTACK_PLAN_DIR -> CLAUDE_PLANS_DIR -> $HOME/.claude/plans -> .claude/plans
-#   TMP_ROOT:          TMPDIR -> TMP -> .gstack/tmp (and mkdir -p, best-effort)
+#   TMP_ROOT:          TMPDIR -> TMP -> <git toplevel, else cwd>/.gstack/tmp
+#                      (and mkdir -p, best-effort)
 # Docs: https://github.com/garrytan/gstack/blob/main/docs/state-root.md
 #
 # Callers guard the eval, because eval "$(f)" succeeds even when f fails:
@@ -117,13 +118,22 @@ fi
 # Tmp root: where ephemeral files (codex stderr captures, etc.) live.
 # Honor TMPDIR / TMP for Windows + container compat; fall back to a
 # project-local .gstack/tmp so we never write to a system /tmp that may
-# be read-only or shared.
+# be read-only or shared. The fallback is anchored at the git toplevel (the
+# folder gstack-clean reclaims), not the cwd: a relative .gstack/tmp run from
+# a subfolder left scratch in <subfolder>/.gstack/tmp, where nothing cleans it.
+# Outside a work tree (no git, a bare repo, inside .git) it stays at the cwd.
 if [ -n "${TMPDIR:-}" ]; then
   _tmp_root="$TMPDIR"
 elif [ -n "${TMP:-}" ]; then
   _tmp_root="$TMP"
 else
-  _tmp_root=".gstack/tmp"
+  if _tmp_top=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$_tmp_top" ]; then
+    _tmp_root="$_tmp_top/.gstack/tmp"
+  elif _tmp_top=$(pwd 2>/dev/null) && [ -n "$_tmp_top" ]; then
+    _tmp_root="$_tmp_top/.gstack/tmp"
+  else
+    _tmp_root=".gstack/tmp"  # never "/.gstack/tmp" from an empty cwd
+  fi
 fi
 # macOS exports TMPDIR with a trailing slash; mktemp templates built as
 # "$TMP_ROOT/name-XXXXXX" would then carry "//", and any consumer comparing
